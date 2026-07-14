@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Chromosome {
@@ -19,6 +19,15 @@ pub struct ContactRecord {
     pub bin_x: i32,
     pub bin_y: i32,
     pub counts: f32,
+}
+
+/// A normalization vector advertised by the file footer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormalizationEntry {
+    pub normalization: Normalization,
+    pub chromosome: Chromosome,
+    pub unit: Unit,
+    pub resolution: i32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +61,9 @@ impl Normalization {
     }
     pub fn is_none(&self) -> bool {
         self.0 == "NONE"
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 impl FromStr for Normalization {
@@ -97,10 +109,15 @@ pub struct HicFile {
     pub path: String,
     pub version: i32,
     pub genome_id: String,
+    pub attributes: BTreeMap<String, String>,
     pub chromosomes: Vec<Chromosome>,
+    /// Base-pair resolutions. Kept for source compatibility; prefer
+    /// [`HicFile::bp_resolutions`].
     pub resolutions: Vec<i32>,
+    pub fragment_resolutions: Vec<i32>,
     master: u64,
     by_name: HashMap<String, usize>,
+    normalization_entries_cache: OnceLock<Vec<NormalizationEntry>>,
 }
 
 impl HicFile {
@@ -122,9 +139,9 @@ impl HicFile {
             r.i64()?;
         }
         let attrs = nonnegative(r.i32()?, "attribute count")?;
+        let mut attributes = BTreeMap::new();
         for _ in 0..attrs {
-            r.cstring()?;
-            r.cstring()?;
+            attributes.insert(r.cstring()?, r.cstring()?);
         }
         let count = nonnegative(r.i32()?, "chromosome count")?;
         let mut chromosomes = Vec::with_capacity(count);
@@ -148,20 +165,162 @@ impl HicFile {
         for _ in 0..n_res {
             resolutions.push(r.i32()?);
         }
+        let n_frag_res = nonnegative(r.i32()?, "fragment resolution count")?;
+        let mut fragment_resolutions = Vec::with_capacity(n_frag_res);
+        for _ in 0..n_frag_res {
+            fragment_resolutions.push(r.i32()?);
+        }
         Ok(Self {
             source,
             path: path.into(),
             version,
             genome_id,
+            attributes,
             chromosomes,
             resolutions,
+            fragment_resolutions,
             master,
             by_name,
+            normalization_entries_cache: OnceLock::new(),
         })
     }
 
     pub fn chromosome(&self, name: &str) -> Option<&Chromosome> {
         self.by_name.get(name).map(|&i| &self.chromosomes[i])
+    }
+
+    /// Genome identifier stored in the hic header, such as `hg38`.
+    pub fn genome_id(&self) -> &str {
+        &self.genome_id
+    }
+
+    /// On-disk hic format version.
+    pub fn version(&self) -> i32 {
+        self.version
+    }
+
+    /// Header attribute/value dictionary.
+    pub fn attributes(&self) -> &BTreeMap<String, String> {
+        &self.attributes
+    }
+
+    /// Chromosomes in their on-disk index order, including index 0 (`All`)
+    /// when the file contains it.
+    pub fn chromosomes(&self) -> &[Chromosome] {
+        &self.chromosomes
+    }
+
+    /// Base-pair resolutions advertised in the header.
+    pub fn bp_resolutions(&self) -> &[i32] {
+        &self.resolutions
+    }
+
+    /// Fragment resolutions advertised in the header.
+    pub fn fragment_resolutions(&self) -> &[i32] {
+        &self.fragment_resolutions
+    }
+
+    /// Resolutions advertised for a particular unit.
+    pub fn resolutions_for(&self, unit: Unit) -> &[i32] {
+        match unit {
+            Unit::BP => self.bp_resolutions(),
+            Unit::Frag => self.fragment_resolutions(),
+        }
+    }
+
+    /// All normalization names available anywhere in the file. `NONE` is
+    /// included because raw observed data is always available without a vector.
+    pub fn normalizations(&self) -> Result<Vec<Normalization>> {
+        let mut names = BTreeSet::new();
+        for entry in self.normalization_entries()? {
+            names.insert(entry.normalization.0.clone());
+        }
+        Ok(normalizations_with_none(names))
+    }
+
+    /// Detailed normalization availability by chromosome, unit, and resolution.
+    /// This reads only the footer index; vector payloads and contact blocks are
+    /// not loaded.
+    pub fn normalization_entries(&self) -> Result<&[NormalizationEntry]> {
+        if self.normalization_entries_cache.get().is_none() {
+            let entries = self.read_normalization_entries()?;
+            let _ = self.normalization_entries_cache.set(entries);
+        }
+        self.normalization_entries_cache
+            .get()
+            .map(Vec::as_slice)
+            .ok_or_else(|| Error::Invalid("normalization cache initialization failed".into()))
+    }
+
+    fn read_normalization_entries(&self) -> Result<Vec<NormalizationEntry>> {
+        let mut r = Reader::new(self.source.clone(), self.master);
+        if self.version > 8 {
+            r.i64()?;
+        } else {
+            r.i32()?;
+        }
+        let matrices = nonnegative(r.i32()?, "matrix index count")?;
+        for _ in 0..matrices {
+            r.cstring()?;
+            r.i64()?;
+            r.i32()?;
+        }
+        skip_expected_maps(&mut r, self.version, false)?;
+        skip_expected_maps(&mut r, self.version, true)?;
+        let count = nonnegative(r.i32()?, "normalization index count")?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let normalization = Normalization::new(r.cstring()?);
+            let chromosome_index = r.i32()?;
+            let unit = Unit::from_str(&r.cstring()?)?;
+            let resolution = r.i32()?;
+            r.i64()?;
+            if self.version > 8 {
+                r.i64()?;
+            } else {
+                r.i32()?;
+            }
+            let chromosome = self
+                .chromosomes
+                .get(usize::try_from(chromosome_index).map_err(|_| {
+                    Error::Invalid("negative chromosome index in normalization entry".into())
+                })?)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "unknown chromosome index {chromosome_index} in normalization entry"
+                    ))
+                })?
+                .clone();
+            entries.push(NormalizationEntry {
+                normalization,
+                chromosome,
+                unit,
+                resolution,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Normalizations usable for one chromosome/unit/resolution combination.
+    pub fn normalizations_for(
+        &self,
+        chromosome: &str,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<Vec<Normalization>> {
+        let chromosome = self
+            .chromosome(chromosome)
+            .ok_or_else(|| Error::ChromosomeNotFound(chromosome.into()))?;
+        let mut names = BTreeSet::new();
+        for entry in self.normalization_entries()? {
+            if entry.chromosome.index == chromosome.index
+                && entry.unit == unit
+                && entry.resolution == resolution
+            {
+                names.insert(entry.normalization.0.clone());
+            }
+        }
+        Ok(normalizations_with_none(names))
     }
 
     pub fn records(
@@ -757,6 +916,32 @@ fn read_len(r: &mut Reader, version: i32) -> Result<u64> {
         "vector length",
     )
 }
+fn skip_expected_maps(r: &mut Reader, version: i32, normalized: bool) -> Result<()> {
+    let count = nonnegative(r.i32()?, "expected vector count")?;
+    for _ in 0..count {
+        if normalized {
+            r.cstring()?;
+        }
+        r.cstring()?;
+        r.i32()?;
+        let values = read_len(r, version)?;
+        let value_width = if version > 8 { 4 } else { 8 };
+        r.skip(
+            values
+                .checked_mul(value_width)
+                .ok_or_else(|| Error::Invalid("expected vector size overflow".into()))?,
+        )?;
+        let factors = u64::try_from(nonnegative(r.i32()?, "normalization factor count")?)
+            .map_err(|_| Error::Invalid("normalization factor count overflow".into()))?;
+        let factor_width = if version > 8 { 8 } else { 12 };
+        r.skip(
+            factors
+                .checked_mul(factor_width)
+                .ok_or_else(|| Error::Invalid("normalization factor size overflow".into()))?,
+        )?;
+    }
+    Ok(())
+}
 fn read_expected(
     r: &mut Reader,
     version: i32,
@@ -808,4 +993,12 @@ fn norm_error(n: &Normalization, c: &Chromosome, u: Unit, r: i32) -> Error {
         resolution: r,
         unit: u.to_string(),
     }
+}
+
+fn normalizations_with_none(mut names: BTreeSet<String>) -> Vec<Normalization> {
+    names.remove("NONE");
+    let mut result = Vec::with_capacity(names.len() + 1);
+    result.push(Normalization::none());
+    result.extend(names.into_iter().map(Normalization));
+    result
 }

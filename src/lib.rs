@@ -10,7 +10,9 @@ mod io;
 mod slice;
 
 pub use error::{Error, Result};
-pub use format::{Chromosome, ContactRecord, HicFile, MatrixType, Normalization, Unit};
+pub use format::{
+    Chromosome, ContactRecord, HicFile, MatrixType, Normalization, NormalizationEntry, Unit,
+};
 pub use slice::{dump, ContactFilter, DumpOptions};
 
 /// Read a sparse matrix slice into memory.

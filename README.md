@@ -71,6 +71,44 @@ HTTP connection pool are reused. `HicFile::records`, `stream_records`,
 `matrix`, `count_records`, and `chromosome_record_counts` correspond to the
 C++ library operations.
 
+Header and footer metadata can be inspected without reading contact blocks:
+
+```rust,no_run
+use straw::{HicFile, Unit};
+
+let hic = HicFile::open("sample.hic")?;
+println!("genome: {}, format: v{}", hic.genome_id(), hic.version());
+
+for chromosome in hic.chromosomes() {
+    println!("{}\t{}", chromosome.name, chromosome.length);
+}
+
+println!("BP resolutions: {:?}", hic.bp_resolutions());
+println!("FRAG resolutions: {:?}", hic.fragment_resolutions());
+println!("all normalizations: {:?}", hic.normalizations()?);
+println!(
+    "chr1 at 10kb: {:?}",
+    hic.normalizations_for("chr1", Unit::BP, 10_000)?,
+);
+
+for entry in hic.normalization_entries()? {
+    println!(
+        "{} {} {} {}",
+        entry.normalization,
+        entry.chromosome.name,
+        entry.unit,
+        entry.resolution,
+    );
+}
+# Ok::<(), straw::Error>(())
+```
+
+A complete metadata example is also available:
+
+```bash
+cargo run --release --example metadata -- sample.hic
+```
+
 ## Compatibility testing
 
 The implementation is tested by comparing CLI output with `C++/build/straw`
