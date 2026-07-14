@@ -1,0 +1,18 @@
+# Rust build artifacts
+/target/
+
+# C++ build artifacts (keep the reference implementation tracked)
+/C++/build/
+/C++/cmake-build-*/
+/C++/straw
+/C++/*.bin
+/C++/straw_test_results.log
+
+# Large Hi-C data and generated slice files
+*.hic
+*.slc
+
+# OS metadata
+.DS_Store
+Thumbs.db
+/C++

@@ -1,0 +1,811 @@
+use crate::block::{read_block, record_count, IndexEntry, RawRecord};
+use crate::io::{open_source, Bytes, RandomAccess, Reader};
+use crate::{Error, Result};
+use rayon::prelude::*;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
+use std::str::FromStr;
+use std::sync::Arc;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chromosome {
+    pub name: String,
+    pub index: i32,
+    pub length: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContactRecord {
+    pub bin_x: i32,
+    pub bin_y: i32,
+    pub counts: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixType {
+    Observed,
+    Oe,
+    Expected,
+}
+impl FromStr for MatrixType {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "observed" => Ok(Self::Observed),
+            "oe" => Ok(Self::Oe),
+            "expected" => Ok(Self::Expected),
+            _ => Err(Error::Argument(format!(
+                "matrix type must be observed, oe, or expected (got {s})"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Normalization(pub String);
+impl Normalization {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into().to_ascii_uppercase())
+    }
+    pub fn none() -> Self {
+        Self("NONE".into())
+    }
+    pub fn is_none(&self) -> bool {
+        self.0 == "NONE"
+    }
+}
+impl FromStr for Normalization {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(Self::new(s))
+    }
+}
+impl fmt::Display for Normalization {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    BP,
+    Frag,
+}
+impl FromStr for Unit {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_uppercase().as_str() {
+            "BP" => Ok(Self::BP),
+            "FRAG" => Ok(Self::Frag),
+            _ => Err(Error::Argument(format!(
+                "unit must be BP or FRAG (got {s})"
+            ))),
+        }
+    }
+}
+impl fmt::Display for Unit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BP => "BP",
+            Self::Frag => "FRAG",
+        })
+    }
+}
+
+pub struct HicFile {
+    pub(crate) source: Arc<dyn RandomAccess>,
+    pub path: String,
+    pub version: i32,
+    pub genome_id: String,
+    pub chromosomes: Vec<Chromosome>,
+    pub resolutions: Vec<i32>,
+    master: u64,
+    by_name: HashMap<String, usize>,
+}
+
+impl HicFile {
+    pub fn open(path: impl AsRef<str>) -> Result<Self> {
+        let path = path.as_ref();
+        let source = open_source(path)?;
+        let mut r = Reader::new(source.clone(), 0);
+        if r.cstring()? != "HIC" {
+            return Err(Error::Invalid("magic string is not HIC".into()));
+        }
+        let version = r.i32()?;
+        if version < 6 {
+            return Err(Error::UnsupportedVersion(version));
+        }
+        let master = positive(r.i64()?, "master index")?;
+        let genome_id = r.cstring()?;
+        if version > 8 {
+            r.i64()?;
+            r.i64()?;
+        }
+        let attrs = nonnegative(r.i32()?, "attribute count")?;
+        for _ in 0..attrs {
+            r.cstring()?;
+            r.cstring()?;
+        }
+        let count = nonnegative(r.i32()?, "chromosome count")?;
+        let mut chromosomes = Vec::with_capacity(count);
+        let mut by_name = HashMap::with_capacity(count);
+        for index in 0..count {
+            let name = r.cstring()?;
+            let length = if version > 8 {
+                r.i64()?
+            } else {
+                r.i32()? as i64
+            };
+            by_name.insert(name.clone(), index);
+            chromosomes.push(Chromosome {
+                name,
+                index: index as i32,
+                length,
+            });
+        }
+        let n_res = nonnegative(r.i32()?, "resolution count")?;
+        let mut resolutions = Vec::with_capacity(n_res);
+        for _ in 0..n_res {
+            resolutions.push(r.i32()?);
+        }
+        Ok(Self {
+            source,
+            path: path.into(),
+            version,
+            genome_id,
+            chromosomes,
+            resolutions,
+            master,
+            by_name,
+        })
+    }
+
+    pub fn chromosome(&self, name: &str) -> Option<&Chromosome> {
+        self.by_name.get(name).map(|&i| &self.chromosomes[i])
+    }
+
+    pub fn records(
+        &self,
+        mt: MatrixType,
+        norm: Normalization,
+        chr1: &str,
+        chr2: &str,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<Vec<ContactRecord>> {
+        let query = self.query(chr1, chr2)?;
+        let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
+        zoom.records(query.region)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Mirrors the established straw API.
+    pub fn stream_records<F>(
+        &self,
+        mt: MatrixType,
+        norm: Normalization,
+        chr1: &str,
+        chr2: &str,
+        unit: Unit,
+        resolution: i32,
+        mut callback: F,
+    ) -> Result<()>
+    where
+        F: FnMut(ContactRecord),
+    {
+        let query = self.query(chr1, chr2)?;
+        let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
+        zoom.stream(query.region, &mut callback)
+    }
+
+    pub fn matrix(
+        &self,
+        mt: MatrixType,
+        norm: Normalization,
+        chr1: &str,
+        chr2: &str,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<Vec<Vec<f32>>> {
+        let query = self.query(chr1, chr2)?;
+        let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
+        let records = zoom.records(query.region)?;
+        if records.is_empty() {
+            return Ok(vec![vec![0.0]]);
+        }
+        let bins = query.region.map(|v| v / resolution as i64);
+        let rows = usize::try_from(bins[1] - bins[0] + 1)
+            .map_err(|_| Error::Argument("matrix row range is too large".into()))?;
+        let cols = usize::try_from(bins[3] - bins[2] + 1)
+            .map_err(|_| Error::Argument("matrix column range is too large".into()))?;
+        let cells = rows
+            .checked_mul(cols)
+            .ok_or_else(|| Error::Argument("matrix dimensions overflow".into()))?;
+        if cells > isize::MAX as usize / 4 {
+            return Err(Error::Argument("matrix is too large to allocate".into()));
+        }
+        let mut matrix = vec![vec![0.0; cols]; rows];
+        for rec in records {
+            let row = rec.bin_x as i64 / resolution as i64 - bins[0];
+            let col = rec.bin_y as i64 / resolution as i64 - bins[2];
+            if row >= 0 && col >= 0 && row < rows as i64 && col < cols as i64 {
+                matrix[row as usize][col as usize] = rec.counts;
+            }
+            if zoom.intra {
+                let row = rec.bin_y as i64 / resolution as i64 - bins[0];
+                let col = rec.bin_x as i64 / resolution as i64 - bins[2];
+                if row >= 0 && col >= 0 && row < rows as i64 && col < cols as i64 {
+                    matrix[row as usize][col as usize] = rec.counts;
+                }
+            }
+        }
+        Ok(matrix)
+    }
+
+    pub fn count_records(&self, resolution: i32, inter_only: bool) -> Result<u64> {
+        let chroms: Vec<_> = self.chromosomes.iter().filter(|c| c.index > 0).collect();
+        let mut total = 0u64;
+        for i in 0..chroms.len() {
+            for j in (i + usize::from(inter_only))..chroms.len() {
+                let z = self.load_zoom(
+                    chroms[i],
+                    chroms[j],
+                    MatrixType::Observed,
+                    &Normalization::none(),
+                    Unit::BP,
+                    resolution,
+                )?;
+                for e in z.blocks.values() {
+                    total = total
+                        .checked_add(record_count(&self.source, *e, self.version)?)
+                        .ok_or_else(|| Error::Invalid("record count overflow".into()))?;
+                }
+            }
+        }
+        Ok(total)
+    }
+
+    pub fn chromosome_record_counts(&self, resolution: i32) -> Result<Vec<(Chromosome, u64)>> {
+        let mut result = Vec::new();
+        for chromosome in self.chromosomes.iter().filter(|c| c.index > 0) {
+            let zoom = self.load_zoom(
+                chromosome,
+                chromosome,
+                MatrixType::Observed,
+                &Normalization::none(),
+                Unit::BP,
+                resolution,
+            )?;
+            let mut total = 0u64;
+            for entry in zoom.blocks.values() {
+                total = total
+                    .checked_add(record_count(&self.source, *entry, self.version)?)
+                    .ok_or_else(|| Error::Invalid("record count overflow".into()))?;
+            }
+            result.push((chromosome.clone(), total));
+        }
+        Ok(result)
+    }
+
+    fn query<'a>(&'a self, a: &str, b: &str) -> Result<Query<'a>> {
+        let (a_name, mut ax, mut ay) = parse_location(a)?;
+        let (b_name, mut bx, mut by) = parse_location(b)?;
+        let ca = self
+            .chromosome(a_name)
+            .ok_or_else(|| Error::ChromosomeNotFound(a_name.into()))?;
+        let cb = self
+            .chromosome(b_name)
+            .ok_or_else(|| Error::ChromosomeNotFound(b_name.into()))?;
+        if ax.is_none() {
+            ax = Some(0);
+            ay = Some(ca.length);
+        }
+        if bx.is_none() {
+            bx = Some(0);
+            by = Some(cb.length);
+        }
+        let ar = [ax.unwrap(), ay.unwrap()];
+        let br = [bx.unwrap(), by.unwrap()];
+        if ar[0] < 0 || br[0] < 0 || ar[1] < ar[0] || br[1] < br[0] {
+            return Err(Error::Argument("invalid genomic range".into()));
+        }
+        if ca.index <= cb.index {
+            Ok(Query {
+                first: ca,
+                second: cb,
+                region: [ar[0], ar[1], br[0], br[1]],
+            })
+        } else {
+            Ok(Query {
+                first: cb,
+                second: ca,
+                region: [br[0], br[1], ar[0], ar[1]],
+            })
+        }
+    }
+
+    pub(crate) fn load_zoom<'a>(
+        &'a self,
+        c1: &Chromosome,
+        c2: &Chromosome,
+        mt: MatrixType,
+        norm: &Normalization,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<MatrixZoomData<'a>> {
+        let footer = self.read_footer(c1.index, c2.index, mt, norm, unit, resolution)?;
+        let norm1 = if norm.is_none() {
+            Vec::new()
+        } else {
+            self.read_norm(
+                footer
+                    .norm1
+                    .ok_or_else(|| norm_error(norm, c1, unit, resolution))?,
+            )?
+        };
+        let norm2 = if norm.is_none() {
+            Vec::new()
+        } else if c1.index == c2.index {
+            norm1.clone()
+        } else {
+            self.read_norm(
+                footer
+                    .norm2
+                    .ok_or_else(|| norm_error(norm, c2, unit, resolution))?,
+            )?
+        };
+        let mut r = Reader::new(self.source.clone(), footer.matrix_position);
+        r.i32()?;
+        r.i32()?;
+        let zoom_count = nonnegative(r.i32()?, "zoom count")?;
+        let mut found = None;
+        for _ in 0..zoom_count {
+            let zoom_unit = r.cstring()?;
+            r.i32()?;
+            let sum_counts = r.f32()?;
+            r.f32()?;
+            r.f32()?;
+            r.f32()?;
+            let bin_size = r.i32()?;
+            let block_bin_count = r.i32()?;
+            let block_column_count = r.i32()?;
+            let n_blocks = nonnegative(r.i32()?, "block count")?;
+            if zoom_unit == unit.to_string() && bin_size == resolution {
+                let mut blocks = BTreeMap::new();
+                for _ in 0..n_blocks {
+                    let number = r.i32()?;
+                    let position = positive(r.i64()?, "block position")?;
+                    let size = positive(r.i32()? as i64, "block size")?;
+                    blocks.insert(number, IndexEntry { position, size });
+                }
+                found = Some((sum_counts, block_bin_count, block_column_count, blocks));
+                break;
+            } else {
+                r.skip(n_blocks as u64 * 16)?;
+            }
+        }
+        let (sum_counts, block_bin_count, block_column_count, blocks) =
+            found.ok_or_else(|| Error::ResolutionNotFound {
+                resolution,
+                unit: unit.to_string(),
+            })?;
+        let bins1 = c1.length / resolution as i64;
+        let bins2 = c2.length / resolution as i64;
+        let average = if c1.index == c2.index {
+            0.0
+        } else {
+            ((sum_counts / bins1 as f32) / bins2 as f32) as f64
+        };
+        Ok(MatrixZoomData {
+            file: self,
+            intra: c1.index == c2.index,
+            version: self.version,
+            resolution,
+            mt,
+            norm: norm.clone(),
+            expected: footer.expected,
+            norm1,
+            norm2,
+            average,
+            block_bin_count,
+            block_column_count,
+            blocks,
+        })
+    }
+
+    fn read_norm(&self, entry: IndexEntry) -> Result<Vec<f64>> {
+        let size = usize::try_from(entry.size)
+            .map_err(|_| Error::Invalid("normalization vector is too large".into()))?;
+        let data = self.source.read_exact_at(entry.position, size)?;
+        let mut r = Bytes::new(&data);
+        let n = if self.version > 8 {
+            r.i64()?
+        } else {
+            r.i32()? as i64
+        };
+        let n = usize::try_from(n)
+            .map_err(|_| Error::Invalid("invalid normalization length".into()))?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(if self.version > 8 {
+                r.f32()? as f64
+            } else {
+                r.f64()?
+            });
+        }
+        Ok(out)
+    }
+
+    fn read_footer(
+        &self,
+        c1: i32,
+        c2: i32,
+        mt: MatrixType,
+        norm: &Normalization,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<Footer> {
+        let mut r = Reader::new(self.source.clone(), self.master);
+        if self.version > 8 {
+            r.i64()?;
+        } else {
+            r.i32()?;
+        }
+        let n = nonnegative(r.i32()?, "matrix index count")?;
+        let key = format!("{c1}_{c2}");
+        let mut matrix = None;
+        for _ in 0..n {
+            let k = r.cstring()?;
+            let pos = positive(r.i64()?, "matrix position")?;
+            r.i32()?;
+            if k == key {
+                matrix = Some(pos);
+            }
+        }
+        let matrix_position = matrix.ok_or_else(|| Error::MatrixNotFound(key))?;
+        let simple = (mt == MatrixType::Observed && norm.is_none())
+            || ((mt == MatrixType::Oe || mt == MatrixType::Expected) && norm.is_none() && c1 != c2);
+        if simple {
+            return Ok(Footer {
+                matrix_position,
+                expected: Vec::new(),
+                norm1: None,
+                norm2: None,
+            });
+        }
+        let mut expected = Vec::new();
+        let n_exp = nonnegative(r.i32()?, "expected vector count")?;
+        for _ in 0..n_exp {
+            let u = r.cstring()?;
+            let bs = r.i32()?;
+            let nv = read_len(&mut r, self.version)?;
+            let store = c1 == c2
+                && mt != MatrixType::Observed
+                && norm.is_none()
+                && u == unit.to_string()
+                && bs == resolution;
+            read_expected(&mut r, self.version, nv, store, &mut expected)?;
+            normalize_expected(&mut r, self.version, c1, store, &mut expected)?;
+        }
+        if c1 == c2 && mt != MatrixType::Observed && norm.is_none() {
+            if expected.is_empty() {
+                return Err(Error::ExpectedNotFound {
+                    resolution,
+                    unit: unit.to_string(),
+                });
+            }
+            return Ok(Footer {
+                matrix_position,
+                expected,
+                norm1: None,
+                norm2: None,
+            });
+        }
+        let n_exp = nonnegative(r.i32()?, "normalized expected vector count")?;
+        for _ in 0..n_exp {
+            let nt = r.cstring()?;
+            let u = r.cstring()?;
+            let bs = r.i32()?;
+            let nv = read_len(&mut r, self.version)?;
+            let store = c1 == c2
+                && mt != MatrixType::Observed
+                && nt == norm.0
+                && u == unit.to_string()
+                && bs == resolution;
+            read_expected(&mut r, self.version, nv, store, &mut expected)?;
+            normalize_expected(&mut r, self.version, c1, store, &mut expected)?;
+        }
+        if c1 == c2 && mt != MatrixType::Observed && !norm.is_none() && expected.is_empty() {
+            return Err(Error::ExpectedNotFound {
+                resolution,
+                unit: unit.to_string(),
+            });
+        }
+        let n_norm = nonnegative(r.i32()?, "normalization index count")?;
+        let mut norm1 = None;
+        let mut norm2 = None;
+        for _ in 0..n_norm {
+            let nt = r.cstring()?;
+            let chr = r.i32()?;
+            let u = r.cstring()?;
+            let res = r.i32()?;
+            let pos = positive(r.i64()?, "normalization position")?;
+            let size = if self.version > 8 {
+                positive(r.i64()?, "normalization size")?
+            } else {
+                positive(r.i32()? as i64, "normalization size")?
+            };
+            if nt == norm.0 && u == unit.to_string() && res == resolution {
+                if chr == c1 {
+                    norm1 = Some(IndexEntry {
+                        position: pos,
+                        size,
+                    });
+                }
+                if chr == c2 {
+                    norm2 = Some(IndexEntry {
+                        position: pos,
+                        size,
+                    });
+                }
+            }
+        }
+        Ok(Footer {
+            matrix_position,
+            expected,
+            norm1,
+            norm2,
+        })
+    }
+}
+
+struct Query<'a> {
+    first: &'a Chromosome,
+    second: &'a Chromosome,
+    region: [i64; 4],
+}
+struct Footer {
+    matrix_position: u64,
+    expected: Vec<f64>,
+    norm1: Option<IndexEntry>,
+    norm2: Option<IndexEntry>,
+}
+
+pub(crate) struct MatrixZoomData<'a> {
+    pub(crate) file: &'a HicFile,
+    pub(crate) intra: bool,
+    version: i32,
+    resolution: i32,
+    mt: MatrixType,
+    norm: Normalization,
+    expected: Vec<f64>,
+    norm1: Vec<f64>,
+    norm2: Vec<f64>,
+    average: f64,
+    block_bin_count: i32,
+    block_column_count: i32,
+    pub(crate) blocks: BTreeMap<i32, IndexEntry>,
+}
+
+impl MatrixZoomData<'_> {
+    fn block_numbers(&self, region: [i64; 4]) -> Result<Vec<i32>> {
+        if self.block_bin_count <= 0 || self.block_column_count <= 0 {
+            return Err(Error::Invalid("invalid block geometry".into()));
+        }
+        let b = region.map(|v| v / self.resolution as i64);
+        let mut set = BTreeSet::new();
+        if self.version > 8 && self.intra {
+            let low = (b[0] + b[2]) / 2 / self.block_bin_count as i64;
+            let high = (b[1] + b[3]) / 2 / self.block_bin_count as i64 + 1;
+            let d1 = ((1.0
+                + (b[0] - b[3]).abs() as f64 / 2f64.sqrt() / self.block_bin_count as f64)
+                .log2()) as i64;
+            let d2 = ((1.0
+                + (b[1] - b[2]).abs() as f64 / 2f64.sqrt() / self.block_bin_count as f64)
+                .log2()) as i64;
+            let mut near = d1.min(d2);
+            if (b[0] > b[3] && b[1] < b[2]) || (b[1] > b[2] && b[0] < b[3]) {
+                near = 0;
+            }
+            let far = d1.max(d2) + 1;
+            for depth in near..=far {
+                for pad in low..=high {
+                    if let Ok(v) = i32::try_from(depth * self.block_column_count as i64 + pad) {
+                        set.insert(v);
+                    }
+                }
+            }
+        } else {
+            let c1 = b[0] / self.block_bin_count as i64;
+            let c2 = (b[1] + 1) / self.block_bin_count as i64;
+            let r1 = b[2] / self.block_bin_count as i64;
+            let r2 = (b[3] + 1) / self.block_bin_count as i64;
+            for row in r1..=r2 {
+                for col in c1..=c2 {
+                    if let Ok(v) = i32::try_from(row * self.block_column_count as i64 + col) {
+                        set.insert(v);
+                    }
+                }
+            }
+            if self.intra {
+                for row in c1..=c2 {
+                    for col in r1..=r2 {
+                        if let Ok(v) = i32::try_from(row * self.block_column_count as i64 + col) {
+                            set.insert(v);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(set
+            .into_iter()
+            .filter(|n| self.blocks.contains_key(n))
+            .collect())
+    }
+    pub(crate) fn raw_block(&self, e: IndexEntry) -> Result<Vec<RawRecord>> {
+        read_block(&self.file.source, e, self.version)
+    }
+    fn records(&self, region: [i64; 4]) -> Result<Vec<ContactRecord>> {
+        let nums = self.block_numbers(region)?;
+        let process = |n: &i32| -> Result<Vec<ContactRecord>> {
+            let raw = read_block(&self.file.source, self.blocks[n], self.version)?;
+            self.filter(raw, region)
+        };
+        let chunks: Result<Vec<Vec<ContactRecord>>> = nums.par_iter().map(process).collect();
+        Ok(chunks?.into_iter().flatten().collect())
+    }
+    fn stream<F: FnMut(ContactRecord)>(&self, region: [i64; 4], callback: &mut F) -> Result<()> {
+        for number in self.block_numbers(region)? {
+            let raw = read_block(&self.file.source, self.blocks[&number], self.version)?;
+            for record in self.filter(raw, region)? {
+                callback(record);
+            }
+        }
+        Ok(())
+    }
+    fn filter(&self, raw: Vec<RawRecord>, region: [i64; 4]) -> Result<Vec<ContactRecord>> {
+        let mut out = Vec::new();
+        for rec in raw {
+            let x = rec.bin_x as i64 * self.resolution as i64;
+            let y = rec.bin_y as i64 * self.resolution as i64;
+            if !((x >= region[0] && x <= region[1] && y >= region[2] && y <= region[3])
+                || (self.intra
+                    && y >= region[0]
+                    && y <= region[1]
+                    && x >= region[2]
+                    && x <= region[3]))
+            {
+                continue;
+            }
+            let mut c = rec.counts;
+            if !self.norm.is_none() {
+                let a = *self
+                    .norm1
+                    .get(rec.bin_x as usize)
+                    .ok_or_else(|| Error::Invalid("normalization vector too short".into()))?;
+                let b = *self
+                    .norm2
+                    .get(rec.bin_y as usize)
+                    .ok_or_else(|| Error::Invalid("normalization vector too short".into()))?;
+                c = (c as f64 / (a * b)) as f32;
+            }
+            if self.mt == MatrixType::Oe {
+                c = (c as f64
+                    / if self.intra {
+                        self.expected_value(rec.bin_x, rec.bin_y)?
+                    } else {
+                        self.average
+                    }) as f32;
+            } else if self.mt == MatrixType::Expected {
+                c = (if self.intra {
+                    self.expected_value(rec.bin_x, rec.bin_y)?
+                } else {
+                    self.average
+                }) as f32;
+            }
+            if c.is_finite() {
+                out.push(ContactRecord {
+                    bin_x: x as i32,
+                    bin_y: y as i32,
+                    counts: c,
+                });
+            }
+        }
+        Ok(out)
+    }
+    fn expected_value(&self, x: i32, y: i32) -> Result<f64> {
+        if self.expected.is_empty() {
+            return Err(Error::ExpectedNotFound {
+                resolution: self.resolution,
+                unit: "BP/FRAG".into(),
+            });
+        }
+        Ok(self.expected[(x.abs_diff(y) as usize).min(self.expected.len() - 1)])
+    }
+}
+
+fn parse_location(s: &str) -> Result<(&str, Option<i64>, Option<i64>)> {
+    let p: Vec<_> = s.split(':').collect();
+    match p.as_slice() {
+        [c] => Ok((c, None, None)),
+        [c, a, b] => Ok((
+            c,
+            Some(
+                a.parse()
+                    .map_err(|_| Error::Argument(format!("invalid coordinate {a}")))?,
+            ),
+            Some(
+                b.parse()
+                    .map_err(|_| Error::Argument(format!("invalid coordinate {b}")))?,
+            ),
+        )),
+        _ => Err(Error::Argument(format!("invalid chromosome location {s}"))),
+    }
+}
+fn positive(v: i64, name: &str) -> Result<u64> {
+    u64::try_from(v).map_err(|_| Error::Invalid(format!("negative {name}")))
+}
+fn nonnegative(v: i32, name: &str) -> Result<usize> {
+    usize::try_from(v).map_err(|_| Error::Invalid(format!("negative {name}")))
+}
+fn read_len(r: &mut Reader, version: i32) -> Result<u64> {
+    positive(
+        if version > 8 {
+            r.i64()?
+        } else {
+            r.i32()? as i64
+        },
+        "vector length",
+    )
+}
+fn read_expected(
+    r: &mut Reader,
+    version: i32,
+    n: u64,
+    store: bool,
+    out: &mut Vec<f64>,
+) -> Result<()> {
+    if store {
+        out.reserve(n as usize);
+        for _ in 0..n {
+            out.push(if version > 8 {
+                r.f32()? as f64
+            } else {
+                r.f64()?
+            });
+        }
+    } else {
+        r.skip(n * if version > 8 { 4 } else { 8 })?;
+    }
+    Ok(())
+}
+fn normalize_expected(
+    r: &mut Reader,
+    version: i32,
+    chr: i32,
+    store: bool,
+    out: &mut [f64],
+) -> Result<()> {
+    let n = nonnegative(r.i32()?, "normalization factor count")?;
+    for _ in 0..n {
+        let c = r.i32()?;
+        let v = if version > 8 {
+            r.f32()? as f64
+        } else {
+            r.f64()?
+        };
+        if store && c == chr {
+            for x in out.iter_mut() {
+                *x /= v;
+            }
+        }
+    }
+    Ok(())
+}
+fn norm_error(n: &Normalization, c: &Chromosome, u: Unit, r: i32) -> Error {
+    Error::NormalizationNotFound {
+        norm: n.0.clone(),
+        chromosome: c.index,
+        resolution: r,
+        unit: u.to_string(),
+    }
+}

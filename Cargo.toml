@@ -1,0 +1,29 @@
+[package]
+name = "hic-straw"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Fast native Rust reader for .hic contact matrices"
+repository = "https://github.com/sa501428/straw-rust"
+documentation = "https://docs.rs/hic-straw"
+readme = "README.md"
+exclude = ["C++/**", "*.hic", ".DS_Store"]
+
+[lib]
+name = "straw"
+path = "src/lib.rs"
+
+[[bin]]
+name = "straw"
+path = "src/main.rs"
+
+[dependencies]
+flate2 = "1.1"
+rayon = "1.10"
+reqwest = { version = "0.11", default-features = false, features = ["blocking", "rustls-tls"] }
+ruzstd = "0.5"
+thiserror = "1.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
