@@ -24,6 +24,10 @@ reqwest = { version = "0.11", default-features = false, features = ["blocking", 
 ruzstd = "0.5"
 thiserror = "1.0"
 
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

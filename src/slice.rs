@@ -36,7 +36,13 @@ pub fn dump(input: &str, output: &str, options: &DumpOptions) -> Result<()> {
     let chromosomes: Vec<_> = hic
         .chromosomes
         .iter()
-        .filter(|c| c.index > 0)
+        .filter(|c| {
+            if hic.version() == 10 {
+                c.name != "All" && c.name != "ALL"
+            } else {
+                c.index > 0
+            }
+        })
         .cloned()
         .collect();
     let mut keys = BTreeMap::new();
@@ -82,6 +88,40 @@ fn write_slice(
                 ContactFilter::Intra | ContactFilter::IntraShort | ContactFilter::IntraLong
             ) && c1.index != c2.index
             {
+                continue;
+            }
+            if hic.version() == 10 {
+                let records = hic.records(
+                    options.matrix_type,
+                    options.normalization.clone(),
+                    &c1.name,
+                    &c2.name,
+                    options.unit,
+                    options.resolution,
+                )?;
+                for rec in records {
+                    let bin_x = rec.bin_x / options.resolution;
+                    let bin_y = rec.bin_y / options.resolution;
+                    if rec.counts <= 0.0
+                        || !rec.counts.is_finite()
+                        || !keep(
+                            bin_x,
+                            bin_y,
+                            c1.index == c2.index,
+                            options.resolution,
+                            options.filter,
+                        )
+                    {
+                        continue;
+                    }
+                    out.write_all(&keys[&c1.name].to_le_bytes())?;
+                    out.write_all(&[0, 0])?;
+                    out.write_all(&bin_x.to_le_bytes())?;
+                    out.write_all(&keys[&c2.name].to_le_bytes())?;
+                    out.write_all(&[0, 0])?;
+                    out.write_all(&bin_y.to_le_bytes())?;
+                    out.write_all(&rec.counts.to_le_bytes())?;
+                }
                 continue;
             }
             let zoom = match hic.load_zoom(

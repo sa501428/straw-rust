@@ -1,5 +1,6 @@
 use crate::block::{read_block, record_count, IndexEntry, RawRecord};
 use crate::io::{open_source, Bytes, RandomAccess, Reader};
+use crate::v10::V10File;
 use crate::{Error, Result};
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -118,6 +119,7 @@ pub struct HicFile {
     master: u64,
     by_name: HashMap<String, usize>,
     normalization_entries_cache: OnceLock<Vec<NormalizationEntry>>,
+    v10: Option<V10File>,
 }
 
 impl HicFile {
@@ -131,6 +133,29 @@ impl HicFile {
         let version = r.i32()?;
         if version < 6 {
             return Err(Error::UnsupportedVersion(version));
+        }
+        if version == 10 {
+            let v10 = V10File::open(path)?;
+            let chromosomes = v10.chromosomes()?;
+            let by_name = chromosomes
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.clone(), i))
+                .collect();
+            return Ok(Self {
+                source,
+                path: path.into(),
+                version,
+                genome_id: v10.genome(),
+                attributes: v10.attributes(),
+                chromosomes,
+                resolutions: v10.resolutions(Unit::BP),
+                fragment_resolutions: v10.resolutions(Unit::Frag),
+                master: 0,
+                by_name,
+                normalization_entries_cache: OnceLock::new(),
+                v10: Some(v10),
+            });
         }
         let master = positive(r.i64()?, "master index")?;
         let genome_id = r.cstring()?;
@@ -182,6 +207,7 @@ impl HicFile {
             master,
             by_name,
             normalization_entries_cache: OnceLock::new(),
+            v10: None,
         })
     }
 
@@ -231,6 +257,9 @@ impl HicFile {
     /// All normalization names available anywhere in the file. `NONE` is
     /// included because raw observed data is always available without a vector.
     pub fn normalizations(&self) -> Result<Vec<Normalization>> {
+        if let Some(v10) = &self.v10 {
+            return Ok(v10.normalizations());
+        }
         let mut names = BTreeSet::new();
         for entry in self.normalization_entries()? {
             names.insert(entry.normalization.0.clone());
@@ -253,6 +282,24 @@ impl HicFile {
     }
 
     fn read_normalization_entries(&self) -> Result<Vec<NormalizationEntry>> {
+        if let Some(v10) = &self.v10 {
+            let mut out = Vec::new();
+            for norm in v10.normalizations().into_iter().filter(|n| !n.is_none()) {
+                for chromosome in &self.chromosomes {
+                    for &unit in &[Unit::BP, Unit::Frag] {
+                        for &resolution in self.resolutions_for(unit) {
+                            out.push(NormalizationEntry {
+                                normalization: norm.clone(),
+                                chromosome: chromosome.clone(),
+                                unit,
+                                resolution,
+                            });
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
         let mut r = Reader::new(self.source.clone(), self.master);
         if self.version > 8 {
             r.i64()?;
@@ -332,9 +379,18 @@ impl HicFile {
         unit: Unit,
         resolution: i32,
     ) -> Result<Vec<ContactRecord>> {
+        if let Some(v10) = &self.v10 {
+            return v10.records(mt, &norm, chr1, chr2, unit, resolution);
+        }
         let query = self.query(chr1, chr2)?;
         let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
-        zoom.records(query.region)
+        let mut records = zoom.records(query.region)?;
+        if query.swapped {
+            for record in &mut records {
+                std::mem::swap(&mut record.bin_x, &mut record.bin_y);
+            }
+        }
+        Ok(records)
     }
 
     #[allow(clippy::too_many_arguments)] // Mirrors the established straw API.
@@ -351,9 +407,23 @@ impl HicFile {
     where
         F: FnMut(ContactRecord),
     {
+        if let Some(v10) = &self.v10 {
+            for record in v10.records(mt, &norm, chr1, chr2, unit, resolution)? {
+                callback(record);
+            }
+            return Ok(());
+        }
         let query = self.query(chr1, chr2)?;
         let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
-        zoom.stream(query.region, &mut callback)
+        if query.swapped {
+            let mut oriented = |mut record: ContactRecord| {
+                std::mem::swap(&mut record.bin_x, &mut record.bin_y);
+                callback(record);
+            };
+            zoom.stream(query.region, &mut oriented)
+        } else {
+            zoom.stream(query.region, &mut callback)
+        }
     }
 
     pub fn matrix(
@@ -365,6 +435,49 @@ impl HicFile {
         unit: Unit,
         resolution: i32,
     ) -> Result<Vec<Vec<f32>>> {
+        if self.v10.is_some() {
+            let records = self.records(mt, norm, chr1, chr2, unit, resolution)?;
+            let (_, ax, ay) = parse_location(chr1)?;
+            let (_, bx, by) = parse_location(chr2)?;
+            let rows = ((ay.unwrap_or_else(|| {
+                self.chromosome(chr1.split(':').next().unwrap())
+                    .unwrap()
+                    .length
+            }) + resolution as i64
+                - 1)
+                / resolution as i64
+                - ax.unwrap_or(0) / resolution as i64) as usize;
+            let cols = ((by.unwrap_or_else(|| {
+                self.chromosome(chr2.split(':').next().unwrap())
+                    .unwrap()
+                    .length
+            }) + resolution as i64
+                - 1)
+                / resolution as i64
+                - bx.unwrap_or(0) / resolution as i64) as usize;
+            let mut result = vec![vec![0.0; cols]; rows];
+            let x0 = ax.unwrap_or(0) / resolution as i64;
+            let y0 = bx.unwrap_or(0) / resolution as i64;
+            for r in records {
+                let x = r.bin_x as i64 / resolution as i64 - x0;
+                let y = r.bin_y as i64 / resolution as i64 - y0;
+                if x >= 0 && y >= 0 && (x as usize) < rows && (y as usize) < cols {
+                    result[x as usize][y as usize] = r.counts;
+                }
+                if chr1.split(':').next() == chr2.split(':').next() {
+                    let reflected_x = r.bin_y as i64 / resolution as i64 - x0;
+                    let reflected_y = r.bin_x as i64 / resolution as i64 - y0;
+                    if reflected_x >= 0
+                        && reflected_y >= 0
+                        && (reflected_x as usize) < rows
+                        && (reflected_y as usize) < cols
+                    {
+                        result[reflected_x as usize][reflected_y as usize] = r.counts;
+                    }
+                }
+            }
+            return Ok(result);
+        }
         let query = self.query(chr1, chr2)?;
         let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
         let records = zoom.records(query.region)?;
@@ -397,10 +510,22 @@ impl HicFile {
                 }
             }
         }
+        if query.swapped {
+            let mut transposed = vec![vec![0.0; rows]; cols];
+            for (r, row) in matrix.into_iter().enumerate() {
+                for (c, value) in row.into_iter().enumerate() {
+                    transposed[c][r] = value;
+                }
+            }
+            return Ok(transposed);
+        }
         Ok(matrix)
     }
 
     pub fn count_records(&self, resolution: i32, inter_only: bool) -> Result<u64> {
+        if let Some(v10) = &self.v10 {
+            return v10.count(resolution, inter_only);
+        }
         let chroms: Vec<_> = self.chromosomes.iter().filter(|c| c.index > 0).collect();
         let mut total = 0u64;
         for i in 0..chroms.len() {
@@ -424,6 +549,27 @@ impl HicFile {
     }
 
     pub fn chromosome_record_counts(&self, resolution: i32) -> Result<Vec<(Chromosome, u64)>> {
+        if self.v10.is_some() {
+            let mut result = Vec::new();
+            for chromosome in self
+                .chromosomes
+                .iter()
+                .filter(|c| c.name != "All" && c.name != "ALL")
+            {
+                let count = self
+                    .records(
+                        MatrixType::Observed,
+                        Normalization::none(),
+                        &chromosome.name,
+                        &chromosome.name,
+                        Unit::BP,
+                        resolution,
+                    )?
+                    .len() as u64;
+                result.push((chromosome.clone(), count));
+            }
+            return Ok(result);
+        }
         let mut result = Vec::new();
         for chromosome in self.chromosomes.iter().filter(|c| c.index > 0) {
             let zoom = self.load_zoom(
@@ -472,12 +618,14 @@ impl HicFile {
                 first: ca,
                 second: cb,
                 region: [ar[0], ar[1], br[0], br[1]],
+                swapped: false,
             })
         } else {
             Ok(Query {
                 first: cb,
                 second: ca,
                 region: [br[0], br[1], ar[0], ar[1]],
+                swapped: true,
             })
         }
     }
@@ -721,6 +869,11 @@ struct Query<'a> {
     first: &'a Chromosome,
     second: &'a Chromosome,
     region: [i64; 4],
+    /// Whether `first`/`second` (and `region`) were swapped from the caller's
+    /// requested order to match on-disk chromosome-index order. Callers must
+    /// undo this swap on returned coordinates so results stay oriented to the
+    /// axes the caller asked for, not internal storage order.
+    swapped: bool,
 }
 struct Footer {
     matrix_position: u64,
@@ -826,13 +979,17 @@ impl MatrixZoomData<'_> {
         for rec in raw {
             let x = rec.bin_x as i64 * self.resolution as i64;
             let y = rec.bin_y as i64 * self.resolution as i64;
-            if !((x >= region[0] && x <= region[1] && y >= region[2] && y <= region[3])
-                || (self.intra
-                    && y >= region[0]
-                    && y <= region[1]
-                    && x >= region[2]
-                    && x <= region[3]))
-            {
+            let direct = x >= region[0] && x <= region[1] && y >= region[2] && y <= region[3];
+            // Cis contacts are stored above the diagonal. A below-diagonal
+            // request only matches the reflected half of the stored contact,
+            // so the emitted coordinates must be reflected too (below) to stay
+            // oriented to the requested axes rather than storage order.
+            let reflected = self.intra
+                && y >= region[0]
+                && y <= region[1]
+                && x >= region[2]
+                && x <= region[3];
+            if !(direct || reflected) {
                 continue;
             }
             let mut c = rec.counts;
@@ -862,9 +1019,10 @@ impl MatrixZoomData<'_> {
                 }) as f32;
             }
             if c.is_finite() {
+                let (out_x, out_y) = if direct { (x, y) } else { (y, x) };
                 out.push(ContactRecord {
-                    bin_x: x as i32,
-                    bin_y: y as i32,
+                    bin_x: out_x as i32,
+                    bin_y: out_y as i32,
                     counts: c,
                 });
             }

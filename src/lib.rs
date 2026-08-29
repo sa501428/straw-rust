@@ -8,6 +8,7 @@ mod error;
 mod format;
 mod io;
 mod slice;
+mod v10;
 
 pub use error::{Error, Result};
 pub use format::{
