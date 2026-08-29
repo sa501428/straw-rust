@@ -1,4 +1,7 @@
-use crate::{Chromosome, ContactRecord, Error, MatrixType, Normalization, Result, Unit};
+use crate::{
+    Chromosome, ContactRecord, Error, MatrixType, Normalization, RawContactRecord, RawValue,
+    Result, Unit,
+};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::Mutex;
 
@@ -9,6 +12,21 @@ struct CRecord {
     value: f32,
 }
 type Callback = unsafe extern "C" fn(*mut c_void, CRecord);
+#[repr(C)]
+struct CRawRecord {
+    x: u64,
+    y: u64,
+    count: u64,
+    score: f32,
+    is_score: u8,
+}
+type RawCallback = unsafe extern "C" fn(*mut c_void, CRawRecord);
+#[repr(C)]
+struct CChromCount {
+    name: *const c_char,
+    count: i64,
+}
+type ChromCountCallback = unsafe extern "C" fn(*mut c_void, CChromCount);
 extern "C" {
     fn straw_v10_error() -> *const c_char;
     fn straw_v10_open(path: *const c_char) -> *mut c_void;
@@ -41,6 +59,32 @@ extern "C" {
         callback: Callback,
     ) -> c_int;
     fn straw_v10_count(file: *mut c_void, resolution: i32, inter: c_int) -> i64;
+    fn straw_v10_vector(
+        file: *mut c_void,
+        expected: c_int,
+        chr: *const c_char,
+        unit: *const c_char,
+        resolution: i32,
+        norm: *const c_char,
+        out_data: *mut *mut f64,
+        out_len: *mut usize,
+    ) -> c_int;
+    fn straw_v10_vector_free(data: *mut f64);
+    fn straw_v10_stream_raw(
+        file: *mut c_void,
+        a: *const c_char,
+        b: *const c_char,
+        unit: *const c_char,
+        resolution: i32,
+        context: *mut c_void,
+        callback: RawCallback,
+    ) -> c_int;
+    fn straw_v10_chromosome_counts(
+        file: *mut c_void,
+        resolution: i32,
+        context: *mut c_void,
+        callback: ChromCountCallback,
+    ) -> c_int;
 }
 
 pub(crate) struct V10File {
@@ -197,6 +241,130 @@ impl V10File {
             Err(last_error())
         } else {
             Ok(n as u64)
+        }
+    }
+    pub fn vector(
+        &self,
+        expected: bool,
+        chr: &str,
+        unit: Unit,
+        resolution: i32,
+        norm: &Normalization,
+    ) -> Result<Vec<f64>> {
+        let chr = CString::new(chr).map_err(|_| Error::Argument("argument contains NUL".into()))?;
+        let unit_s =
+            CString::new(unit_name(unit)).map_err(|_| Error::Argument("argument contains NUL".into()))?;
+        let norm_s =
+            CString::new(norm.as_str()).map_err(|_| Error::Argument("argument contains NUL".into()))?;
+        let mut data: *mut f64 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| Error::Invalid("V10 reader lock poisoned".into()))?;
+        let ok = unsafe {
+            straw_v10_vector(
+                self.raw as *mut c_void,
+                i32::from(expected),
+                chr.as_ptr(),
+                unit_s.as_ptr(),
+                resolution,
+                norm_s.as_ptr(),
+                &mut data,
+                &mut len,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        let out = if data.is_null() {
+            Vec::new()
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+            unsafe { straw_v10_vector_free(data) };
+            slice
+        };
+        if out.is_empty() {
+            return Err(if expected {
+                Error::ExpectedNotFound {
+                    resolution,
+                    unit: unit.to_string(),
+                }
+            } else {
+                Error::Invalid(format!(
+                    "normalization vector {} at {resolution} {unit} not found",
+                    norm.as_str()
+                ))
+            });
+        }
+        Ok(out)
+    }
+    pub fn raw_records(
+        &self,
+        a: &str,
+        b: &str,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<Vec<RawContactRecord>> {
+        unsafe extern "C" fn collect(context: *mut c_void, r: CRawRecord) {
+            (&mut *(context as *mut Vec<RawContactRecord>)).push(RawContactRecord {
+                bin_x: r.x,
+                bin_y: r.y,
+                value: if r.is_score != 0 {
+                    RawValue::Score(r.score)
+                } else {
+                    RawValue::Count(r.count)
+                },
+            });
+        }
+        let a = CString::new(a).map_err(|_| Error::Argument("argument contains NUL".into()))?;
+        let b = CString::new(b).map_err(|_| Error::Argument("argument contains NUL".into()))?;
+        let unit_s =
+            CString::new(unit_name(unit)).map_err(|_| Error::Argument("argument contains NUL".into()))?;
+        let mut out = Vec::new();
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| Error::Invalid("V10 reader lock poisoned".into()))?;
+        let ok = unsafe {
+            straw_v10_stream_raw(
+                self.raw as *mut c_void,
+                a.as_ptr(),
+                b.as_ptr(),
+                unit_s.as_ptr(),
+                resolution,
+                &mut out as *mut _ as *mut c_void,
+                collect,
+            )
+        };
+        if ok == 0 {
+            Err(last_error())
+        } else {
+            Ok(out)
+        }
+    }
+    pub fn chromosome_record_counts(&self, resolution: i32) -> Result<Vec<(String, u64)>> {
+        unsafe extern "C" fn collect(context: *mut c_void, entry: CChromCount) {
+            let name = CStr::from_ptr(entry.name).to_string_lossy().into_owned();
+            (&mut *(context as *mut Vec<(String, u64)>)).push((name, entry.count as u64));
+        }
+        let mut out = Vec::new();
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| Error::Invalid("V10 reader lock poisoned".into()))?;
+        let ok = unsafe {
+            straw_v10_chromosome_counts(
+                self.raw as *mut c_void,
+                resolution,
+                &mut out as *mut _ as *mut c_void,
+                collect,
+            )
+        };
+        if ok == 0 {
+            Err(last_error())
+        } else {
+            Ok(out)
         }
     }
 }

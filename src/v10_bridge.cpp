@@ -27,4 +27,43 @@ int straw_v10_stream(void *p, const char *type, const char *norm, const char *a,
     try { error.clear(); static_cast<straw_v10::File *>(p)->stream(type, norm, a, b, unit, resolution, [&](const contactRecord &r) { callback(context, {r.binX, r.binY, r.counts}); }); return 1; } catch (const std::exception &e) { error = e.what(); return 0; }
 }
 int64_t straw_v10_count(void *p, int32_t resolution, int inter) { try { error.clear(); return static_cast<straw_v10::File *>(p)->countRecords(resolution, inter != 0); } catch (const std::exception &e) { error = e.what(); return -1; } }
+
+int straw_v10_vector(void *p, int expected, const char *chr, const char *unit, int32_t resolution, const char *norm, double **out_data, size_t *out_len) {
+    try {
+        error.clear();
+        auto *file = static_cast<straw_v10::File *>(p);
+        std::vector<double> values = expected ? file->expected(chr, unit, resolution, norm)
+                                               : file->normalization(chr, unit, resolution, norm);
+        double *buffer = values.empty() ? nullptr : static_cast<double *>(malloc(sizeof(double) * values.size()));
+        if (!values.empty()) memcpy(buffer, values.data(), sizeof(double) * values.size());
+        *out_data = buffer;
+        *out_len = values.size();
+        return 1;
+    } catch (const std::exception &e) { error = e.what(); return 0; }
+}
+void straw_v10_vector_free(double *p) { free(p); }
+
+struct StrawV10RawRecord { uint64_t x, y, count; float score; uint8_t is_score; };
+using StrawV10RawCallback = void (*)(void *, StrawV10RawRecord);
+int straw_v10_stream_raw(void *p, const char *a, const char *b, const char *unit, int32_t resolution, void *context, StrawV10RawCallback callback) {
+    try {
+        error.clear();
+        static_cast<straw_v10::File *>(p)->streamRaw(a, b, unit, resolution, [&](const straw_v10::Record &r) {
+            callback(context, {r.binX, r.binY, r.isScore ? 0 : r.count, r.isScore ? r.score : 0.0f,
+                               static_cast<uint8_t>(r.isScore ? 1 : 0)});
+        });
+        return 1;
+    } catch (const std::exception &e) { error = e.what(); return 0; }
+}
+
+struct StrawV10ChromCount { const char *name; int64_t count; };
+using StrawV10ChromCountCallback = void (*)(void *, StrawV10ChromCount);
+int straw_v10_chromosome_counts(void *p, int32_t resolution, void *context, StrawV10ChromCountCallback callback) {
+    try {
+        error.clear();
+        for (const auto &entry : static_cast<straw_v10::File *>(p)->countRecordsByChromosome(resolution))
+            callback(context, {entry.first.c_str(), entry.second});
+        return 1;
+    } catch (const std::exception &e) { error = e.what(); return 0; }
+}
 }

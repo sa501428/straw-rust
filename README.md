@@ -16,6 +16,12 @@ Juicebox `.hic` files. It provides both a Rust library and a command-line tool.
 - BP and fragment units, sparse streaming, sparse vectors, and dense matrices
 - C++-compatible compressed or uncompressed `HICSLICE` dumps and filters
 - genome-wide and per-chromosome record counting
+- normalization and expected-value vector retrieval
+- exact V10 raw records, keeping integer counts and stored float scores
+  distinct rather than routing them through a lossy shared float
+- prepared queries with single-region and batched-region lookups, so repeated
+  sub-region queries do not re-read the footer, index, or normalization
+  vectors each time
 
 Local data is read with positional I/O: the complete `.hic` file is never
 loaded into memory, concurrent block reads do not share a seek cursor, and
@@ -114,6 +120,57 @@ A complete metadata example is also available:
 
 ```bash
 cargo run --release --example metadata -- sample.hic
+```
+
+Fetch the actual normalization and expected-value vectors (not just their
+availability) with `HicFile::normalization_vector` and `expected_vector`:
+
+```rust,no_run
+use straw::{HicFile, Normalization, Unit};
+
+let hic = HicFile::open("sample.hic")?;
+let kr = Normalization::new("KR");
+let norm_vector = hic.normalization_vector("chr1", Unit::BP, 10_000, &kr)?;
+let expected = hic.expected_vector("chr1", Unit::BP, 10_000, &Normalization::none())?;
+# Ok::<(), straw::Error>(())
+```
+
+V10 files additionally expose exact raw records, which keep integer counts and
+stored float scores separate instead of routing exact counts through `f32`:
+
+```rust,no_run
+use straw::{HicFile, RawValue, Unit};
+
+let hic = HicFile::open("sample.hic")?;
+for record in hic.raw_records("chr1", "chr1", Unit::BP, 10_000)? {
+    match record.value {
+        RawValue::Count(count) => println!("{} {} {count}", record.bin_x, record.bin_y),
+        RawValue::Score(score) => println!("{} {} {score}", record.bin_x, record.bin_y),
+    }
+}
+# Ok::<(), straw::Error>(())
+```
+
+`HicFile::prepare` avoids re-reading the footer, block index, and
+normalization vectors for every sub-region lookup against the same
+chromosome pair, matrix type, unit, resolution, and normalization:
+
+```rust,no_run
+use straw::{HicFile, MatrixType, Normalization, Unit};
+
+let hic = HicFile::open("sample.hic")?;
+let query = hic.prepare(
+    MatrixType::Observed,
+    Normalization::none(),
+    "chr1",
+    "chr1",
+    Unit::BP,
+    10_000,
+)?;
+let window = query.window([0, 1_000_000, 2_000_000, 3_000_000])?;
+let batch = query.regions(&[[0, 1_000_000, 0, 1_000_000], [1_000_000, 2_000_000, 1_000_000, 2_000_000]])?;
+println!("{} windowed records, {} batched records", window.len(), batch.x.len());
+# Ok::<(), straw::Error>(())
 ```
 
 ## Compatibility testing

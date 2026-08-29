@@ -22,6 +22,37 @@ pub struct ContactRecord {
     pub counts: f32,
 }
 
+/// A V10 raw value, preserving whether the file stores an exact integer count
+/// or a legacy-precision float score for this bin pair. Only V10 files
+/// distinguish the two; see [`HicFile::raw_records`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RawValue {
+    Count(u64),
+    Score(f32),
+}
+
+/// An exact V10 raw record. Coordinates are bin indices, oriented to the
+/// user-requested axes like [`ContactRecord`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawContactRecord {
+    pub bin_x: u64,
+    pub bin_y: u64,
+    pub value: RawValue,
+}
+
+/// The concatenated result of a [`PreparedQuery::regions`] batch: one
+/// structure-of-arrays result covering every requested region, so a caller
+/// crossing an FFI or language boundary pays one call instead of one per
+/// region or record.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Batch {
+    /// `offsets[i]..offsets[i + 1]` is the record range for the `i`-th region.
+    pub offsets: Vec<usize>,
+    pub x: Vec<i64>,
+    pub y: Vec<i64>,
+    pub values: Vec<f32>,
+}
+
 /// A normalization vector advertised by the file footer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormalizationEntry {
@@ -370,6 +401,126 @@ impl HicFile {
         Ok(normalizations_with_none(names))
     }
 
+    /// The stored normalization vector for one chromosome/unit/resolution.
+    /// Values are indexed by bin. `norm` must not be `NONE`.
+    pub fn normalization_vector(
+        &self,
+        chromosome: &str,
+        unit: Unit,
+        resolution: i32,
+        norm: &Normalization,
+    ) -> Result<Vec<f64>> {
+        if norm.is_none() {
+            return Err(Error::Argument(
+                "normalization_vector requires a normalization other than NONE".into(),
+            ));
+        }
+        if let Some(v10) = &self.v10 {
+            return v10.vector(false, chromosome, unit, resolution, norm);
+        }
+        let chromosome = self
+            .chromosome(chromosome)
+            .ok_or_else(|| Error::ChromosomeNotFound(chromosome.into()))?;
+        let footer = self.read_footer(
+            chromosome.index,
+            chromosome.index,
+            MatrixType::Observed,
+            norm,
+            unit,
+            resolution,
+        )?;
+        let entry = footer
+            .norm1
+            .ok_or_else(|| norm_error(norm, chromosome, unit, resolution))?;
+        self.read_norm(entry)
+    }
+
+    /// The stored expected-value vector for one chromosome/unit/resolution,
+    /// indexed by genomic distance in bins. `norm` may be `NONE` for the raw
+    /// expected vector.
+    pub fn expected_vector(
+        &self,
+        chromosome: &str,
+        unit: Unit,
+        resolution: i32,
+        norm: &Normalization,
+    ) -> Result<Vec<f64>> {
+        if let Some(v10) = &self.v10 {
+            return v10.vector(true, chromosome, unit, resolution, norm);
+        }
+        let chromosome = self
+            .chromosome(chromosome)
+            .ok_or_else(|| Error::ChromosomeNotFound(chromosome.into()))?;
+        let footer = self.read_footer(
+            chromosome.index,
+            chromosome.index,
+            MatrixType::Expected,
+            norm,
+            unit,
+            resolution,
+        )?;
+        if footer.expected.is_empty() {
+            return Err(Error::ExpectedNotFound {
+                resolution,
+                unit: unit.to_string(),
+            });
+        }
+        Ok(footer.expected)
+    }
+
+    /// Exact V10 raw records: integer counts and stored float scores are kept
+    /// separate rather than routed through a lossy shared float, per
+    /// [`RawValue`]. Only supported for V10 files.
+    pub fn raw_records(
+        &self,
+        chr1: &str,
+        chr2: &str,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<Vec<RawContactRecord>> {
+        let v10 = self.v10.as_ref().ok_or_else(|| {
+            Error::Unsupported("exact raw records are available only for V10 files".into())
+        })?;
+        v10.raw_records(chr1, chr2, unit, resolution)
+    }
+
+    /// Prepare a query so repeated sub-region lookups do not reopen the
+    /// footer, index, or normalization vectors for every call. See
+    /// [`PreparedQuery::window`] and [`PreparedQuery::regions`].
+    #[allow(clippy::too_many_arguments)] // Mirrors the established straw API.
+    pub fn prepare(
+        &self,
+        mt: MatrixType,
+        norm: Normalization,
+        chr1: &str,
+        chr2: &str,
+        unit: Unit,
+        resolution: i32,
+    ) -> Result<PreparedQuery<'_>> {
+        if self.v10.is_some() {
+            let name = |s: &str| s.split(':').next().unwrap().to_string();
+            return Ok(PreparedQuery {
+                inner: PreparedInner::V10 {
+                    file: self,
+                    mt,
+                    norm,
+                    chr1: name(chr1),
+                    chr2: name(chr2),
+                    unit,
+                    resolution,
+                },
+            });
+        }
+        let query = self.query(chr1, chr2)?;
+        let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
+        Ok(PreparedQuery {
+            inner: PreparedInner::Legacy {
+                zoom,
+                swapped: query.swapped,
+            },
+        })
+    }
+
     pub fn records(
         &self,
         mt: MatrixType,
@@ -549,26 +700,18 @@ impl HicFile {
     }
 
     pub fn chromosome_record_counts(&self, resolution: i32) -> Result<Vec<(Chromosome, u64)>> {
-        if self.v10.is_some() {
-            let mut result = Vec::new();
-            for chromosome in self
-                .chromosomes
-                .iter()
-                .filter(|c| c.name != "All" && c.name != "ALL")
-            {
-                let count = self
-                    .records(
-                        MatrixType::Observed,
-                        Normalization::none(),
-                        &chromosome.name,
-                        &chromosome.name,
-                        Unit::BP,
-                        resolution,
-                    )?
-                    .len() as u64;
-                result.push((chromosome.clone(), count));
-            }
-            return Ok(result);
+        if let Some(v10) = &self.v10 {
+            return v10
+                .chromosome_record_counts(resolution)?
+                .into_iter()
+                .map(|(name, count)| {
+                    let chromosome = self
+                        .chromosome(&name)
+                        .cloned()
+                        .ok_or_else(|| Error::ChromosomeNotFound(name.clone()))?;
+                    Ok((chromosome, count))
+                })
+                .collect();
         }
         let mut result = Vec::new();
         for chromosome in self.chromosomes.iter().filter(|c| c.index > 0) {
@@ -880,6 +1023,81 @@ struct Footer {
     expected: Vec<f64>,
     norm1: Option<IndexEntry>,
     norm2: Option<IndexEntry>,
+}
+
+/// A query prepared once via [`HicFile::prepare`] and reused across repeated
+/// sub-region window or batch calls, so the footer, block index, and
+/// normalization vectors are not re-read for every call.
+pub struct PreparedQuery<'a> {
+    inner: PreparedInner<'a>,
+}
+enum PreparedInner<'a> {
+    Legacy {
+        zoom: MatrixZoomData<'a>,
+        swapped: bool,
+    },
+    V10 {
+        file: &'a HicFile,
+        mt: MatrixType,
+        norm: Normalization,
+        chr1: String,
+        chr2: String,
+        unit: Unit,
+        resolution: i32,
+    },
+}
+impl PreparedQuery<'_> {
+    /// A single-region window query. `region` is `[x_start, x_end, y_start,
+    /// y_end]` in genomic (BP) or fragment coordinates, oriented to the axes
+    /// the query was prepared with.
+    pub fn window(&self, region: [i64; 4]) -> Result<Vec<ContactRecord>> {
+        match &self.inner {
+            PreparedInner::Legacy { zoom, swapped } => {
+                let mut records = zoom.records(region)?;
+                if *swapped {
+                    for record in &mut records {
+                        std::mem::swap(&mut record.bin_x, &mut record.bin_y);
+                    }
+                }
+                Ok(records)
+            }
+            PreparedInner::V10 {
+                file,
+                mt,
+                norm,
+                chr1,
+                chr2,
+                unit,
+                resolution,
+            } => {
+                let v10 = file.v10.as_ref().ok_or_else(|| {
+                    Error::Invalid("prepared V10 query used against a non-V10 file".into())
+                })?;
+                let loc1 = format!("{chr1}:{}:{}", region[0], region[1]);
+                let loc2 = format!("{chr2}:{}:{}", region[2], region[3]);
+                v10.records(*mt, norm, &loc1, &loc2, *unit, *resolution)
+            }
+        }
+    }
+
+    /// Batched region queries as one concatenated structure-of-arrays result,
+    /// so a caller pays one call per region rather than one call per record.
+    pub fn regions(&self, regions: &[[i64; 4]]) -> Result<Batch> {
+        let mut batch = Batch {
+            offsets: Vec::with_capacity(regions.len() + 1),
+            ..Batch::default()
+        };
+        batch.offsets.push(0);
+        for region in regions {
+            for record in self.window(*region)? {
+                batch.x.push(record.bin_x as i64);
+                batch.y.push(record.bin_y as i64);
+                batch.values.push(record.counts);
+            }
+            batch.offsets.push(batch.x.len());
+        }
+        Ok(batch)
+    }
 }
 
 pub(crate) struct MatrixZoomData<'a> {

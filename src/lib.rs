@@ -12,7 +12,8 @@ mod v10;
 
 pub use error::{Error, Result};
 pub use format::{
-    Chromosome, ContactRecord, HicFile, MatrixType, Normalization, NormalizationEntry, Unit,
+    Batch, Chromosome, ContactRecord, HicFile, MatrixType, Normalization, NormalizationEntry,
+    PreparedQuery, RawContactRecord, RawValue, Unit,
 };
 pub use slice::{dump, ContactFilter, DumpOptions};
 
@@ -71,4 +72,38 @@ pub fn get_num_records_for_chromosomes(
     resolution: i32,
 ) -> Result<Vec<(Chromosome, u64)>> {
     HicFile::open(file)?.chromosome_record_counts(resolution)
+}
+
+/// Read a stored normalization vector. `norm` must not be `NONE`.
+pub fn normalization_vector(
+    file: &str,
+    chromosome: &str,
+    unit: Unit,
+    resolution: i32,
+    norm: &Normalization,
+) -> Result<Vec<f64>> {
+    HicFile::open(file)?.normalization_vector(chromosome, unit, resolution, norm)
+}
+
+/// Read a stored expected-value vector. `norm` may be `NONE`.
+pub fn expected_vector(
+    file: &str,
+    chromosome: &str,
+    unit: Unit,
+    resolution: i32,
+    norm: &Normalization,
+) -> Result<Vec<f64>> {
+    HicFile::open(file)?.expected_vector(chromosome, unit, resolution, norm)
+}
+
+/// Read exact V10 raw records, preserving integer counts and float scores
+/// separately. Only supported for V10 files.
+pub fn raw_records(
+    file: &str,
+    chr1: &str,
+    chr2: &str,
+    unit: Unit,
+    resolution: i32,
+) -> Result<Vec<RawContactRecord>> {
+    HicFile::open(file)?.raw_records(chr1, chr2, unit, resolution)
 }

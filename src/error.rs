@@ -31,6 +31,8 @@ pub enum Error {
     Argument(String),
     #[error("corrupt block: {0}")]
     CorruptBlock(String),
+    #[error("unsupported operation: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
