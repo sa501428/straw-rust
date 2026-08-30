@@ -14,7 +14,6 @@ Juicebox `.hic` files. It provides both a Rust library and a command-line tool.
 - `observed`, `oe`, and `expected` matrices
 - arbitrary normalization names (`NONE`, `VC`, `VC_SQRT`, `KR`, `SCALE`, etc.)
 - BP and fragment units, sparse streaming, sparse vectors, and dense matrices
-- C++-compatible compressed or uncompressed `HICSLICE` dumps and filters
 - genome-wide and per-chromosome record counting
 - normalization and expected-value vector retrieval
 - exact V10 raw records, keeping integer counts and stored float scores
@@ -43,16 +42,16 @@ The executable is `target/release/straw`.
 
 ## CLI
 
-The CLI accepts the same forms as the bundled C++ implementation:
+The CLI exposes contact queries only:
 
 ```text
 straw [observed/oe/expected] <NONE/VC/VC_SQRT/KR> <hicFile> \
       <chr1>[:x1:x2] <chr2>[:y1:y2] <BP/FRAG/MATRIX> <binsize>
 
-straw dump <observed/oe/expected> <normalization> <hicFile> <BP/FRAG> \
-      <binsize> <outputFile> <compressed> \
-      [-intra-short|-intra-long|-inter|-intra]
 ```
+
+Slice and HBS creation intentionally remain C++-only and are not part of the
+Rust library or CLI.
 
 The matrix type is optional and defaults to `observed`, as in C++.
 

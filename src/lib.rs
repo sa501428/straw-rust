@@ -7,7 +7,6 @@ mod block;
 mod error;
 mod format;
 mod io;
-mod slice;
 mod v10;
 
 pub use error::{Error, Result};
@@ -15,9 +14,7 @@ pub use format::{
     Batch, Chromosome, ContactRecord, HicFile, MatrixType, Normalization, NormalizationEntry,
     PreparedQuery, RawContactRecord, RawValue, Unit,
 };
-pub use slice::{dump, ContactFilter, DumpOptions};
-
-/// Read a sparse matrix slice into memory.
+/// Read a sparse matrix window into memory.
 pub fn straw(
     matrix_type: MatrixType,
     norm: Normalization,
@@ -30,7 +27,7 @@ pub fn straw(
     HicFile::open(file)?.records(matrix_type, norm, chr1, chr2, unit, resolution)
 }
 
-/// Stream a sparse matrix slice to a callback in deterministic block order.
+/// Stream a sparse matrix window to a callback in deterministic block order.
 #[allow(clippy::too_many_arguments)] // Mirrors the established straw API.
 pub fn straw_stream<F>(
     matrix_type: MatrixType,
@@ -48,7 +45,7 @@ where
     HicFile::open(file)?.stream_records(matrix_type, norm, chr1, chr2, unit, resolution, callback)
 }
 
-/// Read a matrix slice into a row-major dense matrix.
+/// Read a matrix window into a row-major dense matrix.
 pub fn straw_as_matrix(
     matrix_type: MatrixType,
     norm: Normalization,

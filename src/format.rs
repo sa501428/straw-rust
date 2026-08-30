@@ -1171,9 +1171,6 @@ impl MatrixZoomData<'_> {
             .filter(|n| self.blocks.contains_key(n))
             .collect())
     }
-    pub(crate) fn raw_block(&self, e: IndexEntry) -> Result<Vec<RawRecord>> {
-        read_block(&self.file.source, e, self.version)
-    }
     fn records(&self, region: [i64; 4]) -> Result<Vec<ContactRecord>> {
         let nums = self.block_numbers(region)?;
         let process = |n: &i32| -> Result<Vec<ContactRecord>> {

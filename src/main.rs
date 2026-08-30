@@ -2,7 +2,7 @@ use std::env;
 use std::io::{self, BufWriter, Write};
 use std::process::ExitCode;
 use std::str::FromStr;
-use straw::{ContactFilter, DumpOptions, MatrixType, Normalization, Unit};
+use straw::{MatrixType, Normalization, Unit};
 
 fn main() -> ExitCode {
     match run() {
@@ -16,9 +16,6 @@ fn main() -> ExitCode {
 
 fn run() -> straw::Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("dump") {
-        return run_dump(&args[1..]);
-    }
     if args.len() != 6 && args.len() != 7 {
         return Err(straw::Error::Argument("Usage: straw [observed/oe/expected] <NONE/VC/VC_SQRT/KR> <hicFile> <chr1>[:x1:x2] <chr2>[:y1:y2] <BP/FRAG/MATRIX> <binsize>".into()));
     }
@@ -54,43 +51,6 @@ fn run() -> straw::Result<()> {
     }
     out.flush()?;
     Ok(())
-}
-
-fn run_dump(a: &[String]) -> straw::Result<()> {
-    if a.len() != 7 && a.len() != 8 {
-        return Err(straw::Error::Argument("Usage: straw dump <observed/oe/expected> <NONE/VC/VC_SQRT/KR> <hicFile> <BP/FRAG> <binsize> <outputFile> <compressed> [-intra-short|-intra-long|-inter|-intra]".into()));
-    }
-    let compressed = matches!(
-        a[6].to_ascii_lowercase().as_str(),
-        "1" | "true" | "compressed"
-    );
-    let filter = if let Some(v) = a.get(7) {
-        let v = v.to_ascii_lowercase();
-        if v.contains("inter") {
-            ContactFilter::Inter
-        } else if v.contains("intra") && v.contains("short") {
-            ContactFilter::IntraShort
-        } else if v.contains("intra") && v.contains("long") {
-            ContactFilter::IntraLong
-        } else if v.contains("intra") {
-            ContactFilter::Intra
-        } else {
-            ContactFilter::All
-        }
-    } else {
-        ContactFilter::All
-    };
-    let opts = DumpOptions {
-        matrix_type: MatrixType::from_str(&a[0])?,
-        normalization: Normalization::new(&a[1]),
-        unit: Unit::from_str(&a[3])?,
-        resolution: a[4]
-            .parse()
-            .map_err(|_| straw::Error::Argument("invalid binsize".into()))?,
-        compressed,
-        filter,
-    };
-    straw::dump(&a[2], &a[5], &opts)
 }
 
 fn format_g(value: f32) -> String {
