@@ -3,8 +3,9 @@ use crate::{
     Chromosome, ContactRecord, Error, MatrixType, Normalization, RawContactRecord, RawValue,
     Result, Unit,
 };
+use std::cell::RefCell;
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Cursor as IoCursor, Read};
 use std::sync::{Arc, Mutex};
 
@@ -35,20 +36,36 @@ impl<'a> Cur<'a> {
     fn left(&self) -> usize {
         self.b.len() - self.p
     }
+    #[inline]
+    fn need(&self, n: usize) -> Result<()> {
+        req(n <= self.left(), "truncated record")
+    }
     fn take(&mut self, n: usize) -> Result<Cur<'a>> {
-        req(n <= self.left(), "truncated record")?;
+        self.need(n)?;
         let r = Cur::new(&self.b[self.p..self.p + n]);
         self.p += n;
         Ok(r)
     }
+    #[inline]
     fn u8(&mut self) -> Result<u8> {
-        Ok(self.take(1)?.b[0])
+        self.need(1)?;
+        let value = self.b[self.p];
+        self.p += 1;
+        Ok(value)
     }
+    #[inline]
     fn u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.b.try_into().unwrap()))
+        self.need(4)?;
+        let value = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+        self.p += 4;
+        Ok(value)
     }
+    #[inline]
     fn u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.b.try_into().unwrap()))
+        self.need(8)?;
+        let value = u64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
+        self.p += 8;
+        Ok(value)
     }
     fn var(&mut self) -> Result<u64> {
         let mut v = 0;
@@ -329,10 +346,29 @@ struct Raw {
     y: u32,
     value: RawValue,
 }
+#[derive(Clone)]
+struct VectorChunk {
+    first: u64,
+    count: u32,
+    transform: u8,
+    codec: u8,
+    position: u64,
+    stored: u32,
+    raw: u32,
+}
+#[derive(Clone)]
+struct VectorEntry {
+    count: u64,
+    scales: Vec<(u32, f64)>,
+    chunks: Vec<VectorChunk>,
+}
+type VectorKey = (u32, u32, u8, u32);
+type VectorIndex = BTreeMap<VectorKey, VectorEntry>;
 #[derive(Default)]
 struct Caches {
     zooms: BTreeMap<(u32, u32), Arc<Vec<Zoom>>>,
     indexes: BTreeMap<u64, Arc<Vec<BlockEntry>>>,
+    vector_indexes: BTreeMap<VKind, Arc<VectorIndex>>,
 }
 pub(crate) struct V10File {
     source: Arc<dyn RandomAccess>,
@@ -356,22 +392,34 @@ fn read(s: &Arc<dyn RandomAccess>, l: Loc) -> Result<Vec<u8>> {
         usize::try_from(l.len).map_err(|_| bad("record too large"))?,
     )
 }
+thread_local! {
+    /// One decoder scratch arena per worker thread avoids both per-frame setup
+    /// and serialization of concurrent queries through a reader-wide lock.
+    static ZSTD_DECODER: RefCell<ruzstd::FrameDecoder> =
+        RefCell::new(ruzstd::FrameDecoder::new());
+}
+
 fn unzip(b: &[u8], n: u32) -> Result<Vec<u8>> {
     req(
         n > 0 && u64::from(n) <= LIMIT && b.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]),
         "invalid Zstandard frame",
     )?;
-    let mut d =
-        ruzstd::StreamingDecoder::new(IoCursor::new(b)).map_err(|e| bad(format!("zstd: {e:?}")))?;
-    let mut out = Vec::with_capacity(n as usize);
-    d.read_to_end(&mut out)
-        .map_err(|e| bad(format!("zstd: {e}")))?;
-    req(
-        d.decoder.bytes_read_from_source() == b.len() as u64,
-        "concatenated or trailing Zstandard data",
-    )?;
-    req(out.len() == n as usize, "decompressed length mismatch")?;
-    Ok(out)
+    ZSTD_DECODER.with(|decoder| {
+        let mut decoder = decoder.borrow_mut();
+        let mut stream =
+            ruzstd::StreamingDecoder::new_with_decoder(IoCursor::new(b), &mut *decoder)
+                .map_err(|e| bad(format!("zstd: {e:?}")))?;
+        let mut out = Vec::with_capacity(n as usize);
+        stream
+            .read_to_end(&mut out)
+            .map_err(|e| bad(format!("zstd: {e}")))?;
+        req(
+            stream.decoder.bytes_read_from_source() == b.len() as u64,
+            "concatenated or trailing Zstandard data",
+        )?;
+        req(out.len() == n as usize, "decompressed length mismatch")?;
+        Ok(out)
+    })
 }
 
 impl V10File {
@@ -736,6 +784,8 @@ impl V10File {
         let mut emitted = 0;
         let mut sum = 0;
         let mut prev = 0;
+        let mut bitmap_byte = 0usize;
+        let mut bitmap_bits = if rep == 1 { ps.b[0] } else { 0 };
         for ordinal in 0..slots {
             let value = if mode == 0 {
                 default
@@ -756,12 +806,15 @@ impl V10File {
                 prev = p;
                 (p, true)
             } else if rep == 1 {
-                let mut p = prev;
-                while p < cells && ps.b[p as usize / 8] & (1 << (p as usize % 8)) == 0 {
-                    p += 1
+                while bitmap_bits == 0 {
+                    bitmap_byte += 1;
+                    req(bitmap_byte < ps.b.len(), "bitmap population")?;
+                    bitmap_bits = ps.b[bitmap_byte];
                 }
+                let bit = bitmap_bits.trailing_zeros() as usize;
+                let p = (bitmap_byte * 8 + bit) as u64;
                 req(p < cells, "bitmap population")?;
-                prev = p + 1;
+                bitmap_bits &= bitmap_bits - 1;
                 (p, true)
             } else {
                 let present = if ty == 1 {
@@ -903,9 +956,11 @@ impl V10File {
             .zoom(k, u, z.source)?
             .ok_or_else(|| bad("derived source"))?;
         let f = u64::from(z.bin / s.bin);
-        let mut counts: BTreeMap<(u32, u32), u64> = BTreeMap::new();
-        let mut scores = Vec::new();
-        let mut seen = HashSet::new();
+        let target_cells = (x1 - x0).saturating_mul(y1 - y0);
+        let capacity = min(min(z.occupied, target_cells), 1_000_000) as usize;
+        let mut counts: HashMap<u64, u64> = HashMap::with_capacity(capacity);
+        let mut scores = Vec::with_capacity(capacity);
+        let mut seen = HashSet::with_capacity(capacity);
         self.materialized(
             k,
             &s,
@@ -925,22 +980,25 @@ impl V10File {
                 )?;
                 match r.value {
                     RawValue::Count(v) => {
-                        let p = counts.entry((y, x)).or_default();
+                        let p = counts
+                            .entry((u64::from(y) << 32) | u64::from(x))
+                            .or_default();
                         *p = add(*p, v)?
                     }
-                    RawValue::Score(v) => scores.push(((r.y, r.x), v)),
+                    RawValue::Score(v) => scores.push(((u64::from(r.y) << 32) | u64::from(r.x), v)),
                 }
                 Ok(())
             },
         )?;
         if z.value_type == 1 {
             scores.sort_by_key(|x| x.0);
-            let mut sums: BTreeMap<(u32, u32), f64> = BTreeMap::new();
-            for ((y, x), v) in scores {
+            let mut sums: HashMap<u64, f64> = HashMap::with_capacity(capacity);
+            for (source_key, v) in scores {
                 req(v.is_finite(), "nonfinite source score")?;
-                let p = sums
-                    .entry(((u64::from(y) / f) as u32, (u64::from(x) / f) as u32))
-                    .or_default();
+                let source_y = source_key >> 32;
+                let source_x = source_key & u64::from(u32::MAX);
+                let key = ((source_y / f) << 32) | (source_x / f);
+                let p = sums.entry(key).or_default();
                 *p += f64::from(v);
                 req(p.is_finite(), "score overflow")?
             }
@@ -954,10 +1012,12 @@ impl V10File {
                     "derived occupied count mismatch",
                 )?;
             }
-            for ((y, x), v) in sums {
+            let mut sums: Vec<_> = sums.into_iter().collect();
+            sums.sort_unstable_by_key(|(key, _)| *key);
+            for (key, v) in sums {
                 cb(Raw {
-                    x,
-                    y,
+                    x: key as u32,
+                    y: (key >> 32) as u32,
                     value: RawValue::Score(v as f32),
                 })?
             }
@@ -976,10 +1036,12 @@ impl V10File {
                     .try_fold(0u64, |sum, value| add(sum, *value))?;
                 req(total == z.sum, "derived sum mismatch")?;
             }
-            for ((y, x), v) in counts {
+            let mut counts: Vec<_> = counts.into_iter().collect();
+            counts.sort_unstable_by_key(|(key, _)| *key);
+            for (key, v) in counts {
                 cb(Raw {
-                    x,
-                    y,
+                    x: key as u32,
+                    y: (key >> 32) as u32,
                     value: RawValue::Count(v),
                 })?
             }
@@ -1059,17 +1121,17 @@ impl V10File {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn vector_range(
-        &self,
-        kind: VKind,
-        norm: u32,
-        chr: u32,
-        u: u8,
-        ri: u32,
-        begin: u64,
-        wanted_end: u64,
-    ) -> Result<(Vec<f64>, f64)> {
+    fn vector_index(&self, kind: VKind) -> Result<Arc<VectorIndex>> {
+        if let Some(index) = self
+            .caches
+            .lock()
+            .map_err(|_| bad("cache lock"))?
+            .vector_indexes
+            .get(&kind)
+            .cloned()
+        {
+            return Ok(index);
+        }
         let l = match kind {
             VKind::Norm => self.header.norm,
             VKind::Expected => self.header.expected,
@@ -1088,7 +1150,7 @@ impl V10File {
         c.zero(4)?;
         req(n as usize <= c.left() / 40, "vector entries")?;
         let mut previous = None;
-        let mut result = None;
+        let mut index = BTreeMap::new();
         for _ in 0..n {
             let len = c.u32()?;
             req(len >= 40, "vector entry size")?;
@@ -1128,11 +1190,7 @@ impl V10File {
                     && (count > 0 || chunks == 0),
                 "vector length",
             )?;
-            let matches = eu == u
-                && eri == ri
-                && (kind == VKind::Expected || ni == norm)
-                && (kind != VKind::Norm || ci == chr);
-            let mut scale = 1.0;
+            let mut scales = Vec::new();
             if kind != VKind::Norm {
                 let ns = e.u32()?;
                 e.zero(4)?;
@@ -1145,9 +1203,7 @@ impl V10File {
                         (ch as usize) < self.header.chromosomes.len() && pc.is_none_or(|x| ch > x),
                         "scale key",
                     )?;
-                    if ch == chr {
-                        scale = f64::from(f32::from_bits(bits))
-                    }
+                    scales.push((ch, f64::from(f32::from_bits(bits))));
                     pc = Some(ch)
                 }
             }
@@ -1155,12 +1211,8 @@ impl V10File {
                 u64::from(chunks) * 32 == e.left() as u64,
                 "chunk descriptors",
             )?;
-            let end = min(wanted_end, count);
-            if matches {
-                req(begin <= end && end - begin <= LIMIT / 8, "vector range")?;
-                result = Some((Vec::with_capacity((end - begin) as usize), scale))
-            }
             let mut next = 0;
+            let mut descriptors = Vec::with_capacity(chunks as usize);
             for _ in 0..chunks {
                 let first = e.u64()?;
                 let nc = e.u32()?;
@@ -1182,47 +1234,118 @@ impl V10File {
                 next = add(next, u64::from(nc))?;
                 req(next <= count, "chunk range")?;
                 interval(&self.source, pos, u64::from(stored))?;
-                if !matches || next <= begin || first >= end {
-                    continue;
-                }
-                let cb = self.source.read_exact_at(pos, stored as usize)?;
-                let mut ch = Cur::new(&cb);
-                ch.magic(b"H10V")?;
-                req(ch.u8()? == codec && ch.u8()? == transform, "chunk codec")?;
-                ch.zero(2)?;
-                req(ch.u32()? == raw && ch.u32()? == nc, "chunk size")?;
-                let data = unzip(&ch.b[ch.p..], raw)?;
-                let mut words = Cur::new(&data);
-                let mut prev = 0;
-                for i in 0..nc {
-                    let mut bits = if transform == 1 {
-                        let mut v = 0;
-                        for lane in 0..4 {
-                            v |= u32::from(data[lane * nc as usize + i as usize]) << (lane * 8)
-                        }
-                        v
-                    } else {
-                        words.u32()?
-                    };
-                    if transform == 2 && i > 0 {
-                        bits ^= prev
-                    }
-                    prev = bits;
-                    let at = first + u64::from(i);
-                    if at >= begin && at < end {
-                        result
-                            .as_mut()
-                            .unwrap()
-                            .0
-                            .push(f64::from(f32::from_bits(bits)))
-                    }
-                }
+                descriptors.push(VectorChunk {
+                    first,
+                    count: nc,
+                    transform,
+                    codec,
+                    position: pos,
+                    stored,
+                    raw,
+                });
             }
             req(next == count, "vector coverage")?;
-            e.done()?
+            e.done()?;
+            index.insert(
+                key,
+                VectorEntry {
+                    count,
+                    scales,
+                    chunks: descriptors,
+                },
+            );
         }
         c.done()?;
-        result.ok_or_else(|| bad("vector capability absent"))
+        let index = Arc::new(index);
+        self.caches
+            .lock()
+            .map_err(|_| bad("cache lock"))?
+            .vector_indexes
+            .insert(kind, index.clone());
+        Ok(index)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn vector_range(
+        &self,
+        kind: VKind,
+        norm: u32,
+        chr: u32,
+        u: u8,
+        ri: u32,
+        begin: u64,
+        wanted_end: u64,
+    ) -> Result<(Vec<f64>, f64)> {
+        let key = (
+            if kind == VKind::Expected { 0 } else { norm },
+            if kind == VKind::Norm { chr } else { 0 },
+            u,
+            ri,
+        );
+        let index = self.vector_index(kind)?;
+        let entry = index
+            .get(&key)
+            .ok_or_else(|| bad("vector capability absent"))?;
+        let end = min(wanted_end, entry.count);
+        req(begin <= end && end - begin <= LIMIT / 8, "vector range")?;
+        let scale = entry
+            .scales
+            .binary_search_by_key(&chr, |(chromosome, _)| *chromosome)
+            .ok()
+            .map_or(1.0, |position| entry.scales[position].1);
+        let mut result = Vec::with_capacity((end - begin) as usize);
+        let mut chunk_index = entry
+            .chunks
+            .partition_point(|chunk| chunk.first + u64::from(chunk.count) <= begin);
+        while chunk_index < entry.chunks.len() {
+            let chunk = &entry.chunks[chunk_index];
+            if chunk.first >= end {
+                break;
+            }
+            let bytes = self
+                .source
+                .read_exact_at(chunk.position, chunk.stored as usize)?;
+            let mut stored = Cur::new(&bytes);
+            stored.magic(b"H10V")?;
+            req(
+                stored.u8()? == chunk.codec && stored.u8()? == chunk.transform,
+                "chunk codec",
+            )?;
+            stored.zero(2)?;
+            req(
+                stored.u32()? == chunk.raw && stored.u32()? == chunk.count,
+                "chunk size",
+            )?;
+            let data = unzip(&stored.b[stored.p..], chunk.raw)?;
+            let mut words = Cur::new(&data);
+            let mut previous = 0;
+            for i in 0..chunk.count {
+                let mut bits = if chunk.transform == 1 {
+                    let mut value = 0;
+                    for lane in 0..4 {
+                        value |=
+                            u32::from(data[lane * chunk.count as usize + i as usize]) << (lane * 8)
+                    }
+                    value
+                } else {
+                    words.u32()?
+                };
+                if chunk.transform == 2 && i > 0 {
+                    bits ^= previous
+                }
+                previous = bits;
+                let at = chunk.first + u64::from(i);
+                if at >= begin && at < end {
+                    result.push(f64::from(f32::from_bits(bits)))
+                }
+            }
+            chunk_index += 1;
+        }
+        req(
+            result.len() as u64 == end - begin,
+            "incomplete vector range",
+        )?;
+        Ok((result, scale))
     }
 
     pub fn vector(
@@ -1496,7 +1619,7 @@ impl V10File {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum VKind {
     Norm,
     Expected,
