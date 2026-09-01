@@ -5,8 +5,8 @@ Juicebox `.hic` files. It provides both a Rust library and a command-line tool.
 
 ## Features
 
-- `.hic` versions 6 through 9 plus the consolidated V10 format. V10 support
-  uses the maintained reference parser for materialized and derived
+- `.hic` versions 6 through 9 plus the consolidated V10 format. The native V10
+  parser supports materialized and derived
   resolutions, rotated/rectangular grids, sparse/bitmap/dense blocks, and
   compressed normalization and expected-value vectors
 - zlib and zstd block compression
@@ -29,10 +29,9 @@ one decompressed block at a time.
 
 ## Build
 
-V10 support requires the sibling `straw` checkout (the C++ reference sources),
-plus development installations of libcurl and libzstd discoverable through
-`pkg-config`. This keeps the Rust command and library synchronized with the
-normative reader while the legacy V6-V9 path remains native Rust.
+All supported format versions, including V10, are decoded natively in Rust.
+The crate has no C++ compiler, native libcurl/libzstd, `pkg-config`, or sibling
+repository build requirement.
 
 ```bash
 cargo build --release

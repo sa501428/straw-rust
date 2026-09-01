@@ -157,16 +157,20 @@ impl HicFile {
     pub fn open(path: impl AsRef<str>) -> Result<Self> {
         let path = path.as_ref();
         let source = open_source(path)?;
-        let mut r = Reader::new(source.clone(), 0);
-        if r.cstring()? != "HIC" {
+        // Read the fixed magic/version prefix in one exact range. Besides being
+        // cheaper locally, this avoids a buffered reader speculatively asking
+        // an HTTP server for 64 KiB once per byte while the remote length is
+        // not known yet.
+        let prefix = source.read_exact_at(0, 8)?;
+        if &prefix[..4] != b"HIC\0" {
             return Err(Error::Invalid("magic string is not HIC".into()));
         }
-        let version = r.i32()?;
+        let version = i32::from_le_bytes(prefix[4..8].try_into().unwrap());
         if version < 6 {
             return Err(Error::UnsupportedVersion(version));
         }
         if version == 10 {
-            let v10 = V10File::open(path)?;
+            let v10 = V10File::open(source.clone())?;
             let chromosomes = v10.chromosomes()?;
             let by_name = chromosomes
                 .iter()
@@ -188,6 +192,7 @@ impl HicFile {
                 v10: Some(v10),
             });
         }
+        let mut r = Reader::new(source.clone(), 8);
         let master = positive(r.i64()?, "master index")?;
         let genome_id = r.cstring()?;
         if version > 8 {
@@ -559,10 +564,7 @@ impl HicFile {
         F: FnMut(ContactRecord),
     {
         if let Some(v10) = &self.v10 {
-            for record in v10.records(mt, &norm, chr1, chr2, unit, resolution)? {
-                callback(record);
-            }
-            return Ok(());
+            return v10.stream_records(mt, &norm, chr1, chr2, unit, resolution, callback);
         }
         let query = self.query(chr1, chr2)?;
         let zoom = self.load_zoom(query.first, query.second, mt, &norm, unit, resolution)?;
@@ -1199,11 +1201,8 @@ impl MatrixZoomData<'_> {
             // request only matches the reflected half of the stored contact,
             // so the emitted coordinates must be reflected too (below) to stay
             // oriented to the requested axes rather than storage order.
-            let reflected = self.intra
-                && y >= region[0]
-                && y <= region[1]
-                && x >= region[2]
-                && x <= region[3];
+            let reflected =
+                self.intra && y >= region[0] && y <= region[1] && x >= region[2] && x <= region[3];
             if !(direct || reflected) {
                 continue;
             }

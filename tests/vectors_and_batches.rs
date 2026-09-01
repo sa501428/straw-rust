@@ -5,7 +5,11 @@
 use straw::{ContactRecord, Error, HicFile, MatrixType, Normalization, Unit};
 
 fn fixture() -> String {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../straw/R/inst/extdata/test.hic").to_string()
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../straw/R/inst/extdata/test.hic"
+    )
+    .to_string()
 }
 
 #[test]
@@ -102,7 +106,9 @@ fn prepared_query_window_matches_direct_query() {
             2_500_000,
         )
         .unwrap();
-    let windowed = prepared.window([0, 5_000_000, 10_000_000, 15_000_000]).unwrap();
+    let windowed = prepared
+        .window([0, 5_000_000, 10_000_000, 15_000_000])
+        .unwrap();
 
     assert_eq!(multiset(direct), multiset(windowed));
 }
@@ -145,7 +151,8 @@ fn raw_records_are_unsupported_on_legacy_files() {
 fn multiset(records: Vec<ContactRecord>) -> std::collections::HashMap<(i32, i32, u32), usize> {
     let mut map = std::collections::HashMap::new();
     for r in records {
-        *map.entry((r.bin_x, r.bin_y, r.counts.to_bits())).or_insert(0) += 1;
+        *map.entry((r.bin_x, r.bin_y, r.counts.to_bits()))
+            .or_insert(0) += 1;
     }
     map
 }

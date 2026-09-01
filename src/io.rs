@@ -1,8 +1,9 @@
 use crate::{Error, Result};
 use reqwest::blocking::Client;
-use reqwest::header::RANGE;
+use reqwest::header::{CONTENT_RANGE, RANGE};
 use std::fs::File;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 pub(crate) trait RandomAccess: Send + Sync {
     fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>>;
@@ -16,6 +17,7 @@ pub(crate) fn open_source(path: &str) -> Result<Arc<dyn RandomAccess>> {
         Ok(Arc::new(HttpSource {
             client: Client::builder().user_agent("straw-rust").build()?,
             url: path.to_owned(),
+            length: Mutex::new(None),
         }))
     } else {
         let file = File::open(path)?;
@@ -61,6 +63,7 @@ impl RandomAccess for LocalSource {
 struct HttpSource {
     client: Client,
     url: String,
+    length: Mutex<Option<u64>>,
 }
 
 impl RandomAccess for HttpSource {
@@ -82,14 +85,34 @@ impl RandomAccess for HttpSource {
                 "HTTP server does not support byte ranges".into(),
             ));
         }
+        let content_range = response
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .ok_or_else(|| Error::Invalid("HTTP range response lacks Content-Range".into()))?;
+        let expected_prefix = format!("bytes {offset}-{end}/");
+        let total = content_range
+            .strip_prefix(&expected_prefix)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| Error::Invalid("HTTP server returned the wrong byte range".into()))?;
+        if end >= total {
+            return Err(Error::Invalid("HTTP byte range exceeds file length".into()));
+        }
+        *self
+            .length
+            .lock()
+            .map_err(|_| Error::Invalid("HTTP length cache lock poisoned".into()))? = Some(total);
         let bytes = response.bytes()?;
-        if bytes.len() < len {
+        if bytes.len() != len {
             return Err(Error::Invalid(format!(
-                "short HTTP range: wanted {len}, got {}",
+                "incorrect HTTP range length: wanted {len}, got {}",
                 bytes.len()
             )));
         }
-        Ok(bytes[..len].to_vec())
+        Ok(bytes.to_vec())
+    }
+    fn length(&self) -> Option<u64> {
+        self.length.lock().ok().and_then(|length| *length)
     }
 }
 
