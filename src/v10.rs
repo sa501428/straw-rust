@@ -244,25 +244,6 @@ fn parse_header(b: &[u8]) -> Result<Header> {
             list.push(r)
         }
     }
-    for r in &resolutions[0] {
-        let sb = match r.bin {
-            20 | 50 => 10,
-            200 | 500 => 100,
-            2000 => 1000,
-            _ => 0,
-        };
-        if sb != 0 {
-            let si = resolutions[0].iter().position(|s| s.bin == sb);
-            req(
-                si.is_some() && r.mode == 1 && r.source as usize == si.unwrap(),
-                "mandatory BP derivation",
-            )?
-        }
-        req(
-            r.bin != 500000 || r.mode == 0,
-            "500 kb must be materialized",
-        )?
-    }
     let mut fragments = vec![0; chromosomes.len()];
     if !resolutions[1].is_empty() {
         for (i, f) in fragments.iter_mut().enumerate() {
@@ -1699,10 +1680,69 @@ fn ranges(z: &Zoom, x0: u64, x1: u64, y0: u64, y1: u64) -> Result<Vec<(u32, u32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn leb() {
         let mut c = Cur::new(&[0xac, 2]);
         assert_eq!(c.var().unwrap(), 300);
         assert!(Cur::new(&[0x80, 0]).var().is_err())
+    }
+
+    #[test]
+    fn accepts_user_selected_materialization_and_derivation_pattern() {
+        let bins = [50, 100, 150, 200, 300, 500, 500_000];
+        let mut bytes = vec![0; 88];
+        string(&mut bytes, "testGenome");
+        u32le(&mut bytes, 0); // attributes
+        u32le(&mut bytes, 1); // chromosomes
+        string(&mut bytes, "chr1");
+        u64le(&mut bytes, 1_000_000);
+        u32le(&mut bytes, bins.len() as u32);
+        for (i, bin) in bins.into_iter().enumerate() {
+            u32le(&mut bytes, bin);
+            bytes.push(if i == 0 { 0 } else { 1 });
+            bytes.push(1); // exact summation
+            bytes.extend_from_slice(&[0; 2]);
+            u32le(&mut bytes, if i == 0 { u32::MAX } else { 0 });
+        }
+        u32le(&mut bytes, 0); // FRAG resolutions
+        u32le(&mut bytes, 0); // normalizations
+
+        let header_len = bytes.len() as u64;
+        bytes[0..4].copy_from_slice(b"HIC\0");
+        bytes[4..8].copy_from_slice(&10u32.to_le_bytes());
+        bytes[8..16].copy_from_slice(&header_len.to_le_bytes());
+        bytes[16..24].copy_from_slice(&header_len.to_le_bytes());
+        bytes[24..32].copy_from_slice(&24u64.to_le_bytes());
+
+        let header = parse_header(&bytes).unwrap();
+        assert_eq!(
+            header.resolutions[0]
+                .iter()
+                .map(|resolution| (resolution.bin, resolution.mode, resolution.source))
+                .collect::<Vec<_>>(),
+            vec![
+                (50, 0, u32::MAX),
+                (100, 1, 0),
+                (150, 1, 0),
+                (200, 1, 0),
+                (300, 1, 0),
+                (500, 1, 0),
+                (500_000, 1, 0),
+            ]
+        );
+    }
+
+    fn u32le(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64le(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.push(0);
     }
 }

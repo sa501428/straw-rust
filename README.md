@@ -22,6 +22,11 @@ Juicebox `.hic` files. It provides both a Rust library and a command-line tool.
   sub-region queries do not re-read the footer, index, or normalization
   vectors each time
 
+The standard v10 resolution pyramid is a writer default, not a reader constraint.
+The Rust reader follows each resolution's declared materialized/derived mode and
+direct materialized source, including custom base resolutions and derivation
+patterns.
+
 Local data is read with positional I/O: the complete `.hic` file is never
 loaded into memory, concurrent block reads do not share a seek cursor, and
 independent blocks are decompressed with Rayon. The streaming API retains only
