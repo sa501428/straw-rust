@@ -27,6 +27,14 @@ The Rust reader follows each resolution's declared materialized/derived mode and
 direct materialized source, including custom base resolutions and derivation
 patterns.
 
+V10 cis O/E uses the matching expected vector. Trans `expected` uses the raw
+whole-matrix mean `(sumCountsOrScores / nBins1) / nBins2`, and trans `oe` divides
+observed or normalized contacts by that scalar, matching V9's calculation.
+No cis expected vectors are required. The requested resolution's V10 bin counts
+include partial BP bins and use fragment counts for FRAG; derived matrices use
+their target descriptor. A query window never changes the denominator. Zero or
+non-finite means make expected/OE unavailable.
+
 Local data is read with positional I/O: the complete `.hic` file is never
 loaded into memory, concurrent block reads do not share a seek cursor, and
 independent blocks are decompressed with Rayon. The streaming API retains only

@@ -1437,8 +1437,21 @@ impl V10File {
         let mut ev = Vec::new();
         let mut scale = 1.0;
         let mut eb = 0;
-        if mt != MatrixType::Observed {
-            req(x.chr == y.chr, "expected only for cis")?;
+        let mut trans_expected = 0.0;
+        if mt != MatrixType::Observed && x.chr != y.chr {
+            let Some(z) = self.zoom((min(x.chr, y.chr), max(x.chr, y.chr)), u, ri)? else {
+                return Ok(());
+            };
+            let sum = if z.value_type == 1 {
+                f64::from_bits(z.sum)
+            } else {
+                z.sum as f64
+            };
+            // V9 uses the raw whole-matrix mean, even for normalized O/E.
+            trans_expected = (sum / self.header.bins(x.chr, u, ri)? as f64)
+                / self.header.bins(y.chr, u, ri)? as f64;
+        }
+        if mt != MatrixType::Observed && x.chr == y.chr {
             eb = if x.last <= y.first {
                 y.first - x.last + 1
             } else if y.last <= x.first {
@@ -1505,11 +1518,16 @@ impl V10File {
                     value /= a * b
                 }
                 if mt != MatrixType::Observed {
-                    let d = u64::from(r.x.abs_diff(r.y));
-                    if d < eb || d - eb >= ev.len() as u64 || scale == 0.0 || !scale.is_finite() {
-                        return Ok(());
-                    }
-                    let e = ev[(d - eb) as usize] / scale;
+                    let e = if x.chr == y.chr {
+                        let d = u64::from(r.x.abs_diff(r.y));
+                        if d < eb || d - eb >= ev.len() as u64 || scale == 0.0 || !scale.is_finite()
+                        {
+                            return Ok(());
+                        }
+                        ev[(d - eb) as usize] / scale
+                    } else {
+                        trans_expected
+                    };
                     if e == 0.0 || !e.is_finite() {
                         return Ok(());
                     }

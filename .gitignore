@@ -10,6 +10,8 @@
 
 # Large Hi-C data and generated slice files
 *.hic
+!/tests/data/trans-v10.hic
+!/tests/data/trans-score-v10.hic
 *.slc
 
 # OS metadata
