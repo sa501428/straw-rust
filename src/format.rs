@@ -15,6 +15,21 @@ pub struct Chromosome {
     pub length: i64,
 }
 
+/// Stored scaled All layout. Raw queries use `finest_resolution` in synthetic
+/// BP coordinates; `effective_resolution` is the physical overview scale.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AllOverview {
+    pub chromosome_index: i32,
+    pub finest_resolution: i32,
+    pub source_resolution: u64,
+    pub group_factor: u64,
+    pub effective_resolution: u64,
+    pub bin_count: u64,
+    pub chromosome_indices: Vec<i32>,
+    pub source_offsets: Vec<u64>,
+    pub chromosome_bins: Vec<u64>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContactRecord {
     pub bin_x: i32,
@@ -154,6 +169,83 @@ pub struct HicFile {
 }
 
 impl HicFile {
+    /// Interpret optional scaled-All attributes without changing ordinary queries.
+    pub fn all_overview(&self) -> Result<Option<AllOverview>> {
+        if self.version != 10
+            || self.attributes.get("hicAll.version").map(String::as_str) != Some("1")
+        {
+            return Ok(None);
+        }
+        let invalid = || Error::Invalid("inconsistent scaled All layout".into());
+        let number = |key: &str| -> Result<u64> {
+            let text = self
+                .attributes
+                .get(&format!("hicAll.{key}"))
+                .ok_or_else(invalid)?;
+            if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            let value = text.parse::<u64>().map_err(|_| invalid())?;
+            if value == 0 {
+                return Err(invalid());
+            }
+            Ok(value)
+        };
+        let finest_resolution =
+            i32::try_from(number("finestResolution")?).map_err(|_| invalid())?;
+        let source_resolution = number("sourceResolution")?;
+        let group_factor = number("groupFactor")?;
+        let bin_count = number("binCount")?;
+        let effective_resolution = source_resolution
+            .checked_mul(group_factor)
+            .ok_or_else(invalid)?;
+        let all = self
+            .chromosomes
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case("all"))
+            .ok_or_else(invalid)?;
+        if self.resolutions.first() != Some(&finest_resolution)
+            || bin_count.checked_mul(finest_resolution as u64) != Some(all.length as u64)
+        {
+            return Err(invalid());
+        }
+        let words = self
+            .attributes
+            .get("hicAll.chromosomeBins")
+            .ok_or_else(invalid)?;
+        let mut bins = words.split(',');
+        let mut result = AllOverview {
+            chromosome_index: all.index,
+            finest_resolution,
+            source_resolution,
+            group_factor,
+            effective_resolution,
+            bin_count,
+            chromosome_indices: Vec::new(),
+            source_offsets: Vec::new(),
+            chromosome_bins: Vec::new(),
+        };
+        let mut total = 0u64;
+        for chr in self.chromosomes.iter().filter(|c| c.index != all.index) {
+            let n = bins
+                .next()
+                .ok_or_else(invalid)?
+                .parse::<u64>()
+                .map_err(|_| invalid())?;
+            if n != (chr.length as u64).div_ceil(source_resolution) {
+                return Err(invalid());
+            }
+            result.chromosome_indices.push(chr.index);
+            result.source_offsets.push(total);
+            result.chromosome_bins.push(n);
+            total = total.checked_add(n).ok_or_else(invalid)?;
+        }
+        if bins.next().is_some() || total.div_ceil(group_factor) != bin_count {
+            return Err(invalid());
+        }
+        Ok(Some(result))
+    }
+
     pub fn open(path: impl AsRef<str>) -> Result<Self> {
         let path = path.as_ref();
         let source = open_source(path)?;

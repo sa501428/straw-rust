@@ -193,3 +193,22 @@ on the repository's large `.hic` fixture. Run the standard Rust checks with:
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+
+## Stored scaled All in V10
+
+Files produced by current hictools V10 writers may append `All` at any header
+index. Its useful overview is stored at the smallest advertised BP resolution
+in synthetic coordinates. No All-to-real matrices are required; absent pairs
+query as zero. Real chromosome queries and the global resolution list retain
+their ordinary semantics. Query raw `NONE` data for All; it has no normalization
+vectors. Coarser All levels are valid compact aggregates.
+
+Version-one metadata uses existing attributes: `hicAll.version`,
+`hicAll.finestResolution`, `hicAll.sourceResolution`, `hicAll.groupFactor`,
+`hicAll.binCount`, and `hicAll.chromosomeBins`. The last value lists padded
+source-bin counts of real chromosomes in header order. Physical overview bin
+size is source resolution times group factor; raw queries use the finest
+synthetic resolution. This convention changes no binary fields or file version.
+
+`HicFile::all_overview()` returns `Result<Option<AllOverview>>`.

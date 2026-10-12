@@ -11,8 +11,8 @@ mod v10;
 
 pub use error::{Error, Result};
 pub use format::{
-    Batch, Chromosome, ContactRecord, HicFile, MatrixType, Normalization, NormalizationEntry,
-    PreparedQuery, RawContactRecord, RawValue, Unit,
+    AllOverview, Batch, Chromosome, ContactRecord, HicFile, MatrixType, Normalization,
+    NormalizationEntry, PreparedQuery, RawContactRecord, RawValue, Unit,
 };
 /// Read a sparse matrix window into memory.
 pub fn straw(
