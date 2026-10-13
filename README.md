@@ -38,7 +38,15 @@ non-finite means make expected/OE unavailable.
 Local data is read with positional I/O: the complete `.hic` file is never
 loaded into memory, concurrent block reads do not share a seek cursor, and
 independent blocks are decompressed with Rayon. The streaming API retains only
-one decompressed block at a time.
+one decompressed block at a time. Derived V10 queries also use aggregation
+buffers capped at 65,536 entries, subdividing larger queries as needed while
+preserving the prescribed source-coordinate order for score sums. APIs that
+collect an entire result still allocate memory proportional to that output.
+
+Genomic `start:end` bounds include both endpoints in V9 and V10: a bin is
+selected when its start lies inside those bounds. Dense matrices span
+`floor(start/bin)` through `floor(end/bin)`, including point queries. Internal
+bin rectangles remain half-open.
 
 ## Build
 
@@ -212,3 +220,14 @@ size is source resolution times group factor; raw queries use the finest
 synthetic resolution. This convention changes no binary fields or file version.
 
 `HicFile::all_overview()` returns `Result<Option<AllOverview>>`.
+
+The All metadata API also supports convention **version 2**, which stores the
+V9-style unpadded genome length in kilobases and sparse overview contacts at the
+finest advertised BP resolution. `storageStride` / `storage_stride` relates raw
+finest bin indices to compact display bins; `displayResolution` /
+`display_resolution` is the virtual overview interval, and `coordinateScale` /
+`coordinate_scale` is normally 1000. Version-one compact All remains supported.
+Use the updated native `hic_v10 add-all --rebuild-all INPUT OUTPUT` to migrate
+existing All from its real-chromosome data. This introduces no `.hic` binary
+format change. `kilobase-all.hic` regression fixtures cover unpadded boundaries,
+sparse coordinates, exact uint64 totals and version-one compatibility.

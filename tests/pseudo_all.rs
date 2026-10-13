@@ -21,3 +21,24 @@ fn scaled_all_layout_and_exact_contacts() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn kilobase_all_span_and_sparse_contacts() {
+    let path = format!("{}/tests/data/kilobase-all.hic", env!("CARGO_MANIFEST_DIR"));
+    let hic = HicFile::open(path).unwrap();
+    let all = hic.all_overview().unwrap().unwrap();
+    assert_eq!(all.version, 2);
+    assert_eq!(all.synthetic_length, 170);
+    assert_eq!(all.finest_resolution, 1);
+    assert_eq!(all.storage_stride, 17);
+    assert_eq!(all.display_resolution, 17);
+    assert_eq!(all.effective_resolution, 17000);
+    assert_eq!(all.source_offsets, vec![0, 95000]);
+    assert_eq!(all.chromosome_lengths, vec![95000, 75000]);
+    let records = hic.raw_records("All", "All", Unit::BP, 1).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!((records[0].bin_x, records[0].bin_y), (0, 17));
+    assert_eq!(records[0].value, RawValue::Count((1u64 << 53) + 17));
+    assert_eq!((records[1].bin_x, records[1].bin_y), (85, 153));
+    assert_eq!(records[1].value, RawValue::Count(32));
+}

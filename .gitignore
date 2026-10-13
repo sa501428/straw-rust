@@ -12,6 +12,9 @@
 *.hic
 !/tests/data/trans-v10.hic
 !/tests/data/trans-score-v10.hic
+!/tests/data/large-derived-count.hic
+!/tests/data/large-derived-score.hic
+!/tests/data/large-score-fanin.hic
 *.slc
 
 # OS metadata

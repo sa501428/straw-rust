@@ -19,6 +19,12 @@ pub struct Chromosome {
 /// BP coordinates; `effective_resolution` is the physical overview scale.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllOverview {
+    pub version: u32,
+    pub storage_stride: u64,
+    pub display_resolution: u64,
+    pub coordinate_scale: u64,
+    pub synthetic_length: u64,
+    pub chromosome_lengths: Vec<u64>,
     pub chromosome_index: i32,
     pub finest_resolution: i32,
     pub source_resolution: u64,
@@ -172,7 +178,7 @@ impl HicFile {
     /// Interpret optional scaled-All attributes without changing ordinary queries.
     pub fn all_overview(&self) -> Result<Option<AllOverview>> {
         if self.version != 10
-            || self.attributes.get("hicAll.version").map(String::as_str) != Some("1")
+            || !matches!(self.attributes.get("hicAll.version").map(String::as_str), Some("1" | "2"))
         {
             return Ok(None);
         }
@@ -191,21 +197,24 @@ impl HicFile {
             }
             Ok(value)
         };
+        let version = number("version")? as u32;
         let finest_resolution =
             i32::try_from(number("finestResolution")?).map_err(|_| invalid())?;
         let source_resolution = number("sourceResolution")?;
         let group_factor = number("groupFactor")?;
         let bin_count = number("binCount")?;
-        let effective_resolution = source_resolution
-            .checked_mul(group_factor)
-            .ok_or_else(invalid)?;
+        let storage_stride = if version == 2 { number("storageStride")? } else { 1 };
+        let coordinate_scale = if version == 2 { number("coordinateScale")? } else { 0 };
+        let display_resolution = (finest_resolution as u64).checked_mul(storage_stride).ok_or_else(invalid)?;
+        let effective_resolution = if version == 2 { display_resolution.checked_mul(coordinate_scale) }
+            else { source_resolution.checked_mul(group_factor) }.ok_or_else(invalid)?;
         let all = self
             .chromosomes
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case("all"))
             .ok_or_else(invalid)?;
         if self.resolutions.first() != Some(&finest_resolution)
-            || bin_count.checked_mul(finest_resolution as u64) != Some(all.length as u64)
+            || (version == 1 && bin_count.checked_mul(finest_resolution as u64) != Some(all.length as u64))
         {
             return Err(invalid());
         }
@@ -215,6 +224,8 @@ impl HicFile {
             .ok_or_else(invalid)?;
         let mut bins = words.split(',');
         let mut result = AllOverview {
+            version, storage_stride, display_resolution, coordinate_scale,
+            synthetic_length: all.length as u64, chromosome_lengths: Vec::new(),
             chromosome_index: all.index,
             finest_resolution,
             source_resolution,
@@ -238,9 +249,13 @@ impl HicFile {
             result.chromosome_indices.push(chr.index);
             result.source_offsets.push(total);
             result.chromosome_bins.push(n);
-            total = total.checked_add(n).ok_or_else(invalid)?;
+            result.chromosome_lengths.push(chr.length as u64);
+            total = total.checked_add(if version == 2 { chr.length as u64 } else { n }).ok_or_else(invalid)?;
         }
-        if bins.next().is_some() || total.div_ceil(group_factor) != bin_count {
+        if bins.next().is_some() || (if version == 2 {
+            result.synthetic_length != std::cmp::max(1, total / coordinate_scale) ||
+            result.synthetic_length.div_ceil(display_resolution) != bin_count
+        } else { total.div_ceil(group_factor) != bin_count }) {
             return Err(invalid());
         }
         Ok(Some(result))
@@ -680,29 +695,18 @@ impl HicFile {
         unit: Unit,
         resolution: i32,
     ) -> Result<Vec<Vec<f32>>> {
-        if self.v10.is_some() {
+        if let Some(v10) = &self.v10 {
+            let (x0, rows, first_x) = v10.matrix_bounds(chr1, unit, resolution)?;
+            let (y0, cols, first_y) = v10.matrix_bounds(chr2, unit, resolution)?;
+            let cells = rows.checked_mul(cols)
+                .ok_or_else(|| Error::Argument("matrix dimensions overflow".into()))?;
+            if cells > 512 * 1024 * 1024 / 4 || rows > 512 * 1024 * 1024 / std::mem::size_of::<Vec<f32>>() {
+                return Err(Error::Argument("matrix exceeds allocation limit".into()));
+            }
             let records = self.records(mt, norm, chr1, chr2, unit, resolution)?;
-            let (_, ax, ay) = parse_location(chr1)?;
-            let (_, bx, by) = parse_location(chr2)?;
-            let rows = ((ay.unwrap_or_else(|| {
-                self.chromosome(chr1.split(':').next().unwrap())
-                    .unwrap()
-                    .length
-            }) + resolution as i64
-                - 1)
-                / resolution as i64
-                - ax.unwrap_or(0) / resolution as i64) as usize;
-            let cols = ((by.unwrap_or_else(|| {
-                self.chromosome(chr2.split(':').next().unwrap())
-                    .unwrap()
-                    .length
-            }) + resolution as i64
-                - 1)
-                / resolution as i64
-                - bx.unwrap_or(0) / resolution as i64) as usize;
             let mut result = vec![vec![0.0; cols]; rows];
-            let x0 = ax.unwrap_or(0) / resolution as i64;
-            let y0 = bx.unwrap_or(0) / resolution as i64;
+            let x0 = x0 as i64;
+            let y0 = y0 as i64;
             for r in records {
                 let x = r.bin_x as i64 / resolution as i64 - x0;
                 let y = r.bin_y as i64 / resolution as i64 - y0;
@@ -712,7 +716,9 @@ impl HicFile {
                 if chr1.split(':').next() == chr2.split(':').next() {
                     let reflected_x = r.bin_y as i64 / resolution as i64 - x0;
                     let reflected_y = r.bin_x as i64 / resolution as i64 - y0;
-                    if reflected_x >= 0
+                    if r.bin_y as usize / resolution as usize >= first_x
+                        && r.bin_x as usize / resolution as usize >= first_y
+                        && reflected_x >= 0
                         && reflected_y >= 0
                         && (reflected_x as usize) < rows
                         && (reflected_y as usize) < cols

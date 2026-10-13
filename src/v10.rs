@@ -5,7 +5,7 @@ use crate::{
 };
 use std::cell::RefCell;
 use std::cmp::{max, min};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Cursor as IoCursor, Read};
 use std::sync::{Arc, Mutex};
 
@@ -936,98 +936,199 @@ impl V10File {
         let s = self
             .zoom(k, u, z.source)?
             .ok_or_else(|| bad("derived source"))?;
-        let f = u64::from(z.bin / s.bin);
-        let target_cells = (x1 - x0).saturating_mul(y1 - y0);
-        let capacity = min(min(z.occupied, target_cells), 1_000_000) as usize;
-        let mut counts: HashMap<u64, u64> = HashMap::with_capacity(capacity);
-        let mut scores = Vec::with_capacity(capacity);
-        let mut seen = HashSet::with_capacity(capacity);
-        self.materialized(
-            k,
-            &s,
-            x0 * f,
-            min(x1 * f, self.header.bins(k.0, u, s.ri)?),
-            y0 * f,
-            min(y1 * f, self.header.bins(k.1, u, s.ri)?),
-            |r| {
-                let x = (u64::from(r.x) / f) as u32;
-                let y = (u64::from(r.y) / f) as u32;
-                if !inside(x, y) {
-                    return Ok(());
-                }
-                req(
-                    seen.insert((u64::from(r.y) << 32) | u64::from(r.x)),
-                    "duplicate source cell",
-                )?;
-                match r.value {
-                    RawValue::Count(v) => {
-                        let p = counts
-                            .entry((u64::from(y) << 32) | u64::from(x))
-                            .or_default();
-                        *p = add(*p, v)?
-                    }
-                    RawValue::Score(v) => scores.push(((u64::from(r.y) << 32) | u64::from(r.x), v)),
-                }
-                Ok(())
-            },
-        )?;
-        if z.value_type == 1 {
-            scores.sort_by_key(|x| x.0);
-            let mut sums: HashMap<u64, f64> = HashMap::with_capacity(capacity);
-            for (source_key, v) in scores {
-                req(v.is_finite(), "nonfinite source score")?;
-                let source_y = source_key >> 32;
-                let source_x = source_key & u64::from(u32::MAX);
-                let key = ((source_y / f) << 32) | (source_x / f);
-                let p = sums.entry(key).or_default();
-                *p += f64::from(v);
-                req(p.is_finite(), "score overflow")?
-            }
-            if x0 == 0
-                && y0 == 0
-                && x1 == self.header.bins(k.0, u, ri)?
-                && y1 == self.header.bins(k.1, u, ri)?
-            {
-                req(
-                    sums.len() as u64 == z.occupied,
-                    "derived occupied count mismatch",
-                )?;
-            }
-            let mut sums: Vec<_> = sums.into_iter().collect();
-            sums.sort_unstable_by_key(|(key, _)| *key);
-            for (key, v) in sums {
-                cb(Raw {
-                    x: key as u32,
-                    y: (key >> 32) as u32,
-                    value: RawValue::Score(v as f32),
-                })?
-            }
-        } else {
-            if x0 == 0
-                && y0 == 0
-                && x1 == self.header.bins(k.0, u, ri)?
-                && y1 == self.header.bins(k.1, u, ri)?
-            {
-                req(
-                    counts.len() as u64 == z.occupied,
-                    "derived occupied count mismatch",
-                )?;
-                let total = counts
-                    .values()
-                    .try_fold(0u64, |sum, value| add(sum, *value))?;
-                req(total == z.sum, "derived sum mismatch")?;
-            }
-            let mut counts: Vec<_> = counts.into_iter().collect();
-            counts.sort_unstable_by_key(|(key, _)| *key);
-            for (key, v) in counts {
-                cb(Raw {
-                    x: key as u32,
-                    y: (key >> 32) as u32,
-                    value: RawValue::Count(v),
-                })?
-            }
+        let (emitted, total) =
+            self.derived_tile(k, &z, &s, [x0, x1, y0, y1], [x0, x1, y0, y1], &mut cb)?;
+        if x0 == 0
+            && y0 == 0
+            && x1 == self.header.bins(k.0, u, ri)?
+            && y1 == self.header.bins(k.1, u, ri)?
+        {
+            req(
+                emitted == z.occupied && (z.value_type == 1 || total == z.sum),
+                "derived matrix statistics",
+            )?;
         }
         Ok(())
+    }
+
+    // Split only occupied work that exceeds the buffer, so sparse whole-genome
+    // windows do not enumerate billions of empty tiles.
+    fn derived_tile<F>(
+        &self,
+        k: (u32, u32),
+        z: &Zoom,
+        s: &Zoom,
+        original: [u64; 4],
+        tile: [u64; 4],
+        cb: &mut F,
+    ) -> Result<(u64, u64)>
+    where
+        F: FnMut(Raw) -> Result<()>,
+    {
+        const LIMIT: usize = 65536;
+        let [x0, x1, y0, y1] = original;
+        let [a, b, c, d] = tile;
+        let f = u64::from(z.bin / s.bin);
+        let mut counts = BTreeMap::<u64, u64>::new();
+        let mut scores = Vec::<Raw>::new();
+        let mut split = false;
+        let scan = self.materialized(
+            k,
+            s,
+            a * f,
+            min(b * f, self.header.bins(k.0, s.unit, s.ri)?),
+            c * f,
+            min(d * f, self.header.bins(k.1, s.unit, s.ri)?),
+            |r| {
+                let x = u64::from(r.x) / f;
+                let y = u64::from(r.y) / f;
+                let (px, py) = if x >= x0 && x < x1 && y >= y0 && y < y1 {
+                    (x, y)
+                } else if k.0 == k.1 {
+                    (y, x)
+                } else {
+                    return Ok(());
+                };
+                if px < a || px >= b || py < c || py >= d {
+                    return Ok(());
+                }
+                match r.value {
+                    RawValue::Count(v) => {
+                        let value = counts.entry((y << 32) | x).or_default();
+                        *value = add(*value, v)?;
+                        split = counts.len() > LIMIT;
+                    }
+                    RawValue::Score(_) => {
+                        split = scores.len() == LIMIT;
+                        if !split {
+                            scores.push(r)
+                        }
+                    }
+                }
+                if split {
+                    Err(bad("split derived query"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        if split {
+            drop(counts);
+            drop(scores);
+            let (left, right) = if d - c > 1 {
+                let mid = c + (d - c) / 2;
+                ([a, b, c, mid], [a, b, mid, d])
+            } else if b - a > 1 {
+                let mid = a + (b - a) / 2;
+                ([a, mid, c, d], [mid, b, c, d])
+            } else {
+                let (x, y) = if k.0 == k.1 && a > c { (c, a) } else { (a, c) };
+                let mut sum = 0.;
+                self.ordered_score(
+                    k,
+                    s,
+                    [
+                        x * f,
+                        min((x + 1) * f, self.header.bins(k.0, s.unit, s.ri)?),
+                        y * f,
+                        min((y + 1) * f, self.header.bins(k.1, s.unit, s.ri)?),
+                    ],
+                    &mut sum,
+                )?;
+                cb(Raw {
+                    x: x as u32,
+                    y: y as u32,
+                    value: RawValue::Score(sum as f32),
+                })?;
+                return Ok((1, 0));
+            };
+            let l = self.derived_tile(k, z, s, original, left, cb)?;
+            let r = self.derived_tile(k, z, s, original, right, cb)?;
+            return Ok((add(l.0, r.0)?, add(l.1, r.1)?));
+        }
+        scan?;
+        let mut emitted = 0;
+        let mut total = 0;
+        if z.value_type == 1 {
+            scores.sort_by_key(|r| (r.y, r.x));
+            let mut sums = BTreeMap::<u64, f64>::new();
+            for r in scores {
+                if let RawValue::Score(value) = r.value {
+                    req(value.is_finite(), "nonfinite source score")?;
+                    let acc = sums
+                        .entry(((u64::from(r.y) / f) << 32) | (u64::from(r.x) / f))
+                        .or_default();
+                    *acc += f64::from(value);
+                    req(acc.is_finite(), "score overflow")?;
+                }
+            }
+            for (key, value) in sums {
+                cb(Raw {
+                    x: key as u32,
+                    y: (key >> 32) as u32,
+                    value: RawValue::Score(value as f32),
+                })?;
+                emitted += 1;
+            }
+        } else {
+            for (key, value) in counts {
+                total = add(total, value)?;
+                cb(Raw {
+                    x: key as u32,
+                    y: (key >> 32) as u32,
+                    value: RawValue::Count(value),
+                })?;
+                emitted += 1;
+            }
+        }
+        Ok((emitted, total))
+    }
+
+    // Preserve normative row/column summation order even when a single target
+    // score pixel has more contributing source cells than the query buffer.
+    fn ordered_score(&self, k: (u32, u32), s: &Zoom, tile: [u64; 4], sum: &mut f64) -> Result<()> {
+        let [a, b, c, d] = tile;
+        let mut records = Vec::new();
+        let mut split = false;
+        let scan = self.materialized(k, s, a, b, c, d, |r| {
+            if u64::from(r.x) < a
+                || u64::from(r.x) >= b
+                || u64::from(r.y) < c
+                || u64::from(r.y) >= d
+            {
+                return Ok(());
+            }
+            if records.len() == 65536 {
+                split = true;
+                return Err(bad("split score query"));
+            }
+            records.push(r);
+            Ok(())
+        });
+        if split {
+            drop(records);
+            if d - c > 1 {
+                let mid = c + (d - c) / 2;
+                self.ordered_score(k, s, [a, b, c, mid], sum)?;
+                self.ordered_score(k, s, [a, b, mid, d], sum)
+            } else {
+                req(b - a > 1, "duplicate source cells")?;
+                let mid = a + (b - a) / 2;
+                self.ordered_score(k, s, [a, mid, c, d], sum)?;
+                self.ordered_score(k, s, [mid, b, c, d], sum)
+            }
+        } else {
+            scan?;
+            records.sort_by_key(|r| (r.y, r.x));
+            for r in records {
+                if let RawValue::Score(value) = r.value {
+                    req(value.is_finite(), "nonfinite source score")?;
+                    *sum += f64::from(value);
+                    req(sum.is_finite(), "score overflow")?;
+                }
+            }
+            Ok(())
+        }
     }
     #[allow(clippy::too_many_arguments)]
     fn raw<F>(
@@ -1091,15 +1192,23 @@ impl V10File {
             _ => return Err(bad("region needs start:end")),
         };
         let bin = u64::from(self.header.resolutions[u as usize][ri as usize].bin);
+        // External Straw coordinates include both endpoints; select bin starts
+        // inside those bounds, then use half-open bin intervals internally.
+        let bins = self.header.bins(chr, u, ri)?;
+        let first = min(bins, a.div_ceil(bin));
         Ok(Region {
             chr,
-            first: a / bin,
-            last: if a == b {
-                a / bin
-            } else {
-                b / bin + u64::from(b % bin != 0)
-            },
+            first,
+            last: first.max(min(bins, b / bin + 1)),
+            origin: a / bin,
+            end: b / bin + 1,
         })
+    }
+
+    pub(crate) fn matrix_bounds(&self, location: &str, unit: Unit, resolution: i32) -> Result<(usize, usize, usize)> {
+        let u = uid(unit);
+        let r = self.region(location, u, self.ri(u, resolution)?)?;
+        Ok((r.origin as usize, (r.end - r.origin) as usize, r.first as usize))
     }
 
     fn vector_index(&self, kind: VKind) -> Result<Arc<VectorIndex>> {
@@ -1628,6 +1737,8 @@ struct Region {
     chr: u32,
     first: u64,
     last: u64,
+    origin: u64,
+    end: u64,
 }
 fn uid(u: Unit) -> u8 {
     u8::from(u == Unit::Frag)
