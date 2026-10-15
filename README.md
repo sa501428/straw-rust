@@ -35,6 +35,12 @@ include partial BP bins and use fragment counts for FRAG; derived matrices use
 their target descriptor. A query window never changes the denominator. Zero or
 non-finite means make expected/OE unavailable.
 
+For V9, observed queries and normalized trans queries use the header's direct
+normalization-index locator instead of walking the expected-value sections.
+Normalization availability uses the same bounded index reader and does not
+load vector payloads. Missing or incomplete locators retain the footer-scan
+fallback; cis OE/expected still reads the expected vectors it requires.
+
 Local data is read with positional I/O: the complete `.hic` file is never
 loaded into memory, concurrent block reads do not share a seek cursor, and
 independent blocks are decompressed with Rayon. The streaming API retains only

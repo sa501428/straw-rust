@@ -123,6 +123,7 @@ pub(crate) struct Reader {
     pos: u64,
     start: u64,
     cache: Vec<u8>,
+    end: Option<u64>,
 }
 
 impl Reader {
@@ -132,7 +133,23 @@ impl Reader {
             pos,
             start: 0,
             cache: Vec::new(),
+            end: None,
         }
+    }
+    pub fn bounded(source: Arc<dyn RandomAccess>, pos: u64, len: u64) -> Result<Self> {
+        let end = pos.checked_add(len).ok_or_else(|| Error::Invalid("index interval overflow".into()))?;
+        if source.length().is_some_and(|size| end > size) {
+            return Err(Error::Invalid("normalization index outside file".into()));
+        }
+        let mut reader = Self::new(source, pos);
+        reader.end = Some(end);
+        Ok(reader)
+    }
+    pub fn finish(&self) -> Result<()> {
+        if self.end.is_some_and(|end| self.pos != end) {
+            return Err(Error::Invalid("normalization index length mismatch".into()));
+        }
+        Ok(())
     }
     pub fn skip(&mut self, n: u64) -> Result<()> {
         self.pos = self
@@ -142,10 +159,14 @@ impl Reader {
         Ok(())
     }
     fn take(&mut self, n: usize) -> Result<&[u8]> {
+        if self.end.is_some_and(|end| self.pos > end || n as u64 > end - self.pos) {
+            return Err(Error::Invalid("truncated normalization index".into()));
+        }
         let cached_end = self.start + self.cache.len() as u64;
         if self.pos < self.start || self.pos + n as u64 > cached_end {
             self.start = self.pos;
             let desired = n.max(64 * 1024);
+            let desired = self.end.map_or(desired, |end| desired.min((end - self.pos) as usize));
             let desired = self.source.length().map_or(desired, |len| {
                 desired.min(len.saturating_sub(self.pos) as usize)
             });

@@ -169,6 +169,7 @@ pub struct HicFile {
     pub resolutions: Vec<i32>,
     pub fragment_resolutions: Vec<i32>,
     master: u64,
+    normalization_index: Option<(u64, u64)>,
     by_name: HashMap<String, usize>,
     normalization_entries_cache: OnceLock<Vec<NormalizationEntry>>,
     v10: Option<V10File>,
@@ -294,6 +295,7 @@ impl HicFile {
                 resolutions: v10.resolutions(Unit::BP),
                 fragment_resolutions: v10.resolutions(Unit::Frag),
                 master: 0,
+                normalization_index: None,
                 by_name,
                 normalization_entries_cache: OnceLock::new(),
                 v10: Some(v10),
@@ -302,10 +304,11 @@ impl HicFile {
         let mut r = Reader::new(source.clone(), 8);
         let master = positive(r.i64()?, "master index")?;
         let genome_id = r.cstring()?;
-        if version > 8 {
-            r.i64()?;
-            r.i64()?;
-        }
+        let normalization_index = if version == 9 {
+            let position = r.i64()?;
+            let length = r.i64()?;
+            if position > 0 && length > 0 { Some((position as u64, length as u64)) } else { None }
+        } else { None };
         let attrs = nonnegative(r.i32()?, "attribute count")?;
         let mut attributes = BTreeMap::new();
         for _ in 0..attrs {
@@ -348,6 +351,7 @@ impl HicFile {
             resolutions,
             fragment_resolutions,
             master,
+            normalization_index,
             by_name,
             normalization_entries_cache: OnceLock::new(),
             v10: None,
@@ -424,6 +428,27 @@ impl HicFile {
             .ok_or_else(|| Error::Invalid("normalization cache initialization failed".into()))
     }
 
+    fn normalization_index_reader(&self) -> Result<Reader> {
+        if let Some((position, length)) = self.normalization_index {
+            return Reader::bounded(self.source.clone(), position, length);
+        }
+        let mut r = Reader::new(self.source.clone(), self.master);
+        if self.version > 8 {
+            r.i64()?;
+        } else {
+            r.i32()?;
+        }
+        let matrices = nonnegative(r.i32()?, "matrix index count")?;
+        for _ in 0..matrices {
+            r.cstring()?;
+            r.i64()?;
+            r.i32()?;
+        }
+        skip_expected_maps(&mut r, self.version, false)?;
+        skip_expected_maps(&mut r, self.version, true)?;
+        Ok(r)
+    }
+
     fn read_normalization_entries(&self) -> Result<Vec<NormalizationEntry>> {
         if let Some(v10) = &self.v10 {
             let mut out = Vec::new();
@@ -443,20 +468,7 @@ impl HicFile {
             }
             return Ok(out);
         }
-        let mut r = Reader::new(self.source.clone(), self.master);
-        if self.version > 8 {
-            r.i64()?;
-        } else {
-            r.i32()?;
-        }
-        let matrices = nonnegative(r.i32()?, "matrix index count")?;
-        for _ in 0..matrices {
-            r.cstring()?;
-            r.i64()?;
-            r.i32()?;
-        }
-        skip_expected_maps(&mut r, self.version, false)?;
-        skip_expected_maps(&mut r, self.version, true)?;
+        let mut r = self.normalization_index_reader()?;
         let count = nonnegative(r.i32()?, "normalization index count")?;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
@@ -488,6 +500,7 @@ impl HicFile {
                 resolution,
             });
         }
+        r.finish()?;
         Ok(entries)
     }
 
@@ -1023,52 +1036,57 @@ impl HicFile {
             });
         }
         let mut expected = Vec::new();
-        let n_exp = nonnegative(r.i32()?, "expected vector count")?;
-        for _ in 0..n_exp {
-            let u = r.cstring()?;
-            let bs = r.i32()?;
-            let nv = read_len(&mut r, self.version)?;
-            let store = c1 == c2
-                && mt != MatrixType::Observed
-                && norm.is_none()
-                && u == unit.to_string()
-                && bs == resolution;
-            read_expected(&mut r, self.version, nv, store, &mut expected)?;
-            normalize_expected(&mut r, self.version, c1, store, &mut expected)?;
-        }
-        if c1 == c2 && mt != MatrixType::Observed && norm.is_none() {
-            if expected.is_empty() {
+        if self.normalization_index.is_some() && !norm.is_none() &&
+            (mt == MatrixType::Observed || c1 != c2) {
+            r = self.normalization_index_reader()?;
+        } else {
+            let n_exp = nonnegative(r.i32()?, "expected vector count")?;
+            for _ in 0..n_exp {
+                let u = r.cstring()?;
+                let bs = r.i32()?;
+                let nv = read_len(&mut r, self.version)?;
+                let store = c1 == c2
+                    && mt != MatrixType::Observed
+                    && norm.is_none()
+                    && u == unit.to_string()
+                    && bs == resolution;
+                read_expected(&mut r, self.version, nv, store, &mut expected)?;
+                normalize_expected(&mut r, self.version, c1, store, &mut expected)?;
+            }
+            if c1 == c2 && mt != MatrixType::Observed && norm.is_none() {
+                if expected.is_empty() {
+                    return Err(Error::ExpectedNotFound {
+                        resolution,
+                        unit: unit.to_string(),
+                    });
+                }
+                return Ok(Footer {
+                    matrix_position,
+                    expected,
+                    norm1: None,
+                    norm2: None,
+                });
+            }
+            let n_exp = nonnegative(r.i32()?, "normalized expected vector count")?;
+            for _ in 0..n_exp {
+                let nt = r.cstring()?;
+                let u = r.cstring()?;
+                let bs = r.i32()?;
+                let nv = read_len(&mut r, self.version)?;
+                let store = c1 == c2
+                    && mt != MatrixType::Observed
+                    && nt == norm.0
+                    && u == unit.to_string()
+                    && bs == resolution;
+                read_expected(&mut r, self.version, nv, store, &mut expected)?;
+                normalize_expected(&mut r, self.version, c1, store, &mut expected)?;
+            }
+            if c1 == c2 && mt != MatrixType::Observed && !norm.is_none() && expected.is_empty() {
                 return Err(Error::ExpectedNotFound {
                     resolution,
                     unit: unit.to_string(),
                 });
             }
-            return Ok(Footer {
-                matrix_position,
-                expected,
-                norm1: None,
-                norm2: None,
-            });
-        }
-        let n_exp = nonnegative(r.i32()?, "normalized expected vector count")?;
-        for _ in 0..n_exp {
-            let nt = r.cstring()?;
-            let u = r.cstring()?;
-            let bs = r.i32()?;
-            let nv = read_len(&mut r, self.version)?;
-            let store = c1 == c2
-                && mt != MatrixType::Observed
-                && nt == norm.0
-                && u == unit.to_string()
-                && bs == resolution;
-            read_expected(&mut r, self.version, nv, store, &mut expected)?;
-            normalize_expected(&mut r, self.version, c1, store, &mut expected)?;
-        }
-        if c1 == c2 && mt != MatrixType::Observed && !norm.is_none() && expected.is_empty() {
-            return Err(Error::ExpectedNotFound {
-                resolution,
-                unit: unit.to_string(),
-            });
         }
         let n_norm = nonnegative(r.i32()?, "normalization index count")?;
         let mut norm1 = None;
@@ -1099,6 +1117,7 @@ impl HicFile {
                 }
             }
         }
+        r.finish()?;
         Ok(Footer {
             matrix_position,
             expected,
@@ -1471,4 +1490,85 @@ fn normalizations_with_none(mut names: BTreeSet<String>) -> Vec<Normalization> {
     result.push(Normalization::none());
     result.extend(names.into_iter().map(Normalization));
     result
+}
+
+#[cfg(test)]
+mod v9_index_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Source {
+        data: Vec<u8>,
+        requests: Mutex<Vec<(u64, usize)>>,
+    }
+    impl RandomAccess for Source {
+        fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+            self.requests.lock().unwrap().push((offset, len));
+            self.data.get(offset as usize..offset as usize + len)
+                .map(|bytes| bytes.to_vec())
+                .ok_or_else(|| Error::Invalid("short test range".into()))
+        }
+        fn length(&self) -> Option<u64> { Some(self.data.len() as u64) }
+    }
+    fn fixture(direct: bool) -> (HicFile, Arc<Source>, u64, u64) {
+        let mut data = vec![0; 128];
+        let master = data.len() as u64;
+        data.extend_from_slice(&0i64.to_le_bytes());
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(b"0_0\0");
+        data.extend_from_slice(&64i64.to_le_bytes());
+        data.extend_from_slice(&0i32.to_le_bytes());
+        if direct {
+            // These are intentionally not parseable expected-value sections.
+            data.extend_from_slice(&(-1i32).to_le_bytes());
+            data.resize(256, 255);
+        } else {
+            data.extend_from_slice(&0i32.to_le_bytes()); // raw expected
+            data.extend_from_slice(&0i32.to_le_bytes()); // normalized expected
+        }
+        let position = data.len() as u64;
+        data.extend_from_slice(&1i32.to_le_bytes());
+        data.extend_from_slice(b"VC\0");
+        data.extend_from_slice(&0i32.to_le_bytes());
+        data.extend_from_slice(b"BP\0");
+        data.extend_from_slice(&10i32.to_le_bytes());
+        data.extend_from_slice(&4096i64.to_le_bytes());
+        data.extend_from_slice(&48i64.to_le_bytes());
+        let length = data.len() as u64 - position;
+        let source = Arc::new(Source { data, requests: Mutex::new(Vec::new()) });
+        let file = HicFile {
+            source: source.clone(), path: "memory".into(), version: 9,
+            genome_id: "hg38".into(), attributes: BTreeMap::new(),
+            chromosomes: vec![Chromosome { name: "chrA".into(), index: 0, length: 100 }],
+            resolutions: vec![10], fragment_resolutions: Vec::new(), master,
+            normalization_index: direct.then_some((position, length)),
+            by_name: HashMap::from([("chrA".into(), 0)]),
+            normalization_entries_cache: OnceLock::new(), v10: None,
+        };
+        (file, source, position, length)
+    }
+    #[test]
+    fn observed_uses_bounded_direct_index_and_names_do_not_read_vectors() {
+        let (file, source, position, length) = fixture(true);
+        let footer = file.read_footer(0, 0, MatrixType::Observed, &Normalization::new("VC"), Unit::BP, 10).unwrap();
+        assert_eq!(footer.norm1.unwrap().position, 4096);
+        assert_eq!(footer.norm2.unwrap().position, 4096);
+        assert!(footer.expected.is_empty());
+        assert!(source.requests.lock().unwrap().contains(&(position, length as usize)));
+        assert_eq!(file.normalization_entries().unwrap().len(), 1);
+        assert!(source.requests.lock().unwrap().iter().all(|&(offset, _)| offset < 4096));
+        // Cis OE must still read expected values rather than taking this shortcut.
+        assert!(file.read_footer(0, 0, MatrixType::Oe, &Normalization::new("VC"), Unit::BP, 10).is_err());
+    }
+    #[test]
+    fn absent_locator_uses_footer_and_bad_lengths_are_rejected() {
+        let (file, _, _, _) = fixture(false);
+        assert!(file.read_footer(0, 0, MatrixType::Observed, &Normalization::new("VC"), Unit::BP, 10).is_ok());
+        assert_eq!(file.normalization_entries().unwrap().len(), 1);
+        let (mut file, _, position, length) = fixture(true);
+        file.normalization_index = Some((position, length - 1));
+        assert!(file.read_footer(0, 0, MatrixType::Observed, &Normalization::new("VC"), Unit::BP, 10).is_err());
+        file.normalization_index = Some((position, length + 1));
+        assert!(file.normalization_entries().is_err());
+    }
 }
